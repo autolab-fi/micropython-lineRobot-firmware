@@ -1,4 +1,5 @@
 freeze("$(PORT_DIR)/modules")
+# freeze("$(PORT_DIR)/modules/hubabuba.py")
 include("$(MPY_DIR)/extmod/asyncio")
 
 # Useful networking-related packages.

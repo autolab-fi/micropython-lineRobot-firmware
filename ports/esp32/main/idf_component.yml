@@ -1,14 +1,21 @@
 ## IDF Component Manager Manifest File
 dependencies:
-  espressif/mdns: "~1.1.0"
+  espressif/mdns: ~1.2.3
   espressif/esp_tinyusb:
     rules:
-      - if: "target in [esp32s2, esp32s3]"
-    version: "~1.0.0"
+    - if: target in [esp32s2, esp32s3]
+    version: ~1.0.0
   espressif/lan867x:
-    version: "~1.0.0"
+    version: ~1.0.0
     rules:
-      - if: "target == esp32"
-      - if: "idf_version >=5.3"
+    - if: target == esp32
+    - if: idf_version >=5.3
+  # cJSON: "*"
+  esp_wifi_remote:
+    version: '*'
   idf:
-    version: ">=5.2.0"
+    version: '>=5.2.0'
+# build:
+#   include_dirs: ["."]
+#   source_files: ["config_manager.c",  "mqtt_client.c"]
+  # espressif/arduino-esp32: '3.2.0'

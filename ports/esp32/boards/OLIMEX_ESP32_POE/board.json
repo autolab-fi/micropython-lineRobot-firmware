@@ -19,8 +19,8 @@
         "ESP32-POE-ISO-1.jpg"
     ],
     "mcu": "esp32",
-    "product": "ESP32 POE",
+    "product": "Olimex ESP32 POE",
     "thumbnail": "",
-    "url": "https://www.olimex.com/Products/IoT/ESP32/ESP32-POE",
-    "vendor": "Olimex"
+    "url": "https://www.olimex.com/",
+    "vendor": "OLIMEX"
 }

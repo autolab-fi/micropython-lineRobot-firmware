@@ -37,6 +37,8 @@
 #include "driver/uart.h" // For uart_get_sclk_freq()
 #include "hal/uart_hal.h"
 #include "soc/uart_periph.h"
+#include "freertos/stream_buffer.h"
+extern StreamBufferHandle_t mqtt_print_stream; // Объявлен в C-коде ядра
 
 static void uart_irq_handler(void *arg);
 
@@ -81,13 +83,33 @@ int uart_stdout_tx_strn(const char *str, size_t len) {
     uart_hal_context_t repl_hal = REPL_HAL_DEFN();
     size_t remaining = len;
     uint32_t written = 0;
-    // TODO add a timeout
+    static bool skip_next = false;
+
+    // filter empty messages
+    if (len == 0) return 0;
+
+    //  if next message starts with \n or \r, skip it
+    if (len == 1 && (*str == '\n' || *str == '\r')) {
+        if (skip_next) {
+            skip_next = false;
+            goto UART_ONLY; // Пропускаем для MQTT
+        }
+    }
+
+    // send to MQTT
+    if (mqtt_print_stream != NULL) {
+        // check if last char is \n or \r
+        bool ends_with_newline = (len > 0 && (str[len-1] == '\n' || str[len-1] == '\r'));
+        
+        xStreamBufferSend(mqtt_print_stream, str, len, 0);
+        skip_next = ends_with_newline; // set skip_next if last char is \n or \r
+    }
+
+UART_ONLY:
+    // send to UART
     for (;;) {
         uart_hal_write_txfifo(&repl_hal, (const void *)str, remaining, &written);
-
-        if (written >= remaining) {
-            break;
-        }
+        if (written >= remaining) break;
         remaining -= written;
         str += written;
         ulTaskNotifyTake(pdFALSE, 1);

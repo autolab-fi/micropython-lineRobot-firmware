@@ -97,6 +97,10 @@ if(MICROPY_PY_TINYUSB)
     list(APPEND MICROPY_INC_TINYUSB
         ${MICROPY_DIR}/shared/tinyusb/
     )
+
+    list(APPEND MICROPY_LINK_TINYUSB
+        -Wl,--wrap=dcd_event_handler
+    )
 endif()
 
 list(APPEND MICROPY_SOURCE_PORT
@@ -135,6 +139,12 @@ list(APPEND MICROPY_SOURCE_PORT
     machine_rtc.c
     machine_sdcard.c
     modespnow.c
+    mqtt_handler.c
+    uart_handler.c
+    settings_manager.c
+    cJSON.c
+    cJSON_Utils.c
+    micropython_task.c
 )
 list(TRANSFORM MICROPY_SOURCE_PORT PREPEND ${MICROPY_PORT_DIR}/)
 list(APPEND MICROPY_SOURCE_PORT ${CMAKE_BINARY_DIR}/pins.c)
@@ -204,6 +214,7 @@ endif()
 
 # Register the main IDF component.
 idf_component_register(
+    #REQUIRES fatfs
     SRCS
         ${MICROPY_SOURCE_PY}
         ${MICROPY_SOURCE_EXTMOD}
@@ -224,6 +235,10 @@ idf_component_register(
         ${MICROPY_LDFRAGMENTS}
     REQUIRES
         ${IDF_COMPONENTS}
+    REQUIRES mqtt
+    REQUIRES spiffs
+    REQUIRES esp_http_client
+    #REQUIRES esp_https_ota
 )
 
 # Set the MicroPython target as the current (main) IDF component target.
@@ -255,6 +270,10 @@ target_compile_options(${MICROPY_TARGET} PUBLIC
     -Wno-clobbered
     -Wno-deprecated-declarations
     -Wno-missing-field-initializers
+)
+
+target_link_options(${MICROPY_TARGET} PUBLIC
+     ${MICROPY_LINK_TINYUSB}
 )
 
 # Additional include directories needed for private NimBLE headers.
