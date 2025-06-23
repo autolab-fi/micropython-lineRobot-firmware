@@ -30,7 +30,9 @@
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
-#define BUFFSIZE 1024
+#define OTA_BUFFER_SIZE 4096
+#define OTA_MAX_RETRIES 3
+#define OTA_RETRY_DELAY 5000  // 5 seconds
 
 // Topic buffers
 #define MAX_STR_LEN 64
@@ -116,97 +118,251 @@ static void reset_watchdog() {
     esp_task_wdt_reset();
 }
 
+static esp_err_t ota_http_event_handler(esp_http_client_event_t *evt)
+{
+    switch (evt->event_id) {
+        case HTTP_EVENT_ERROR:
+            ESP_LOGE(TAG, "HTTP_EVENT_ERROR");
+            break;
+        case HTTP_EVENT_ON_CONNECTED:
+            ESP_LOGI(TAG, "HTTP_EVENT_ON_CONNECTED");
+            break;
+        case HTTP_EVENT_HEADER_SENT:
+            ESP_LOGI(TAG, "HTTP_EVENT_HEADER_SENT");
+            break;
+        case HTTP_EVENT_ON_HEADER:
+            ESP_LOGI(TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
+            break;
+        case HTTP_EVENT_ON_DATA:
+            ESP_LOGD(TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
+            break;
+        case HTTP_EVENT_ON_FINISH:
+            ESP_LOGI(TAG, "HTTP_EVENT_ON_FINISH");
+            break;
+        case HTTP_EVENT_DISCONNECTED:
+            ESP_LOGI(TAG, "HTTP_EVENT_DISCONNECTED");
+            break;
+        default:
+            break;
+    }
+    return ESP_OK;
+}
+
 // OTA update function
-static void perform_ota_update(const char *url) {
+// Improved OTA update function with retry logic and state validation
+static void perform_ota_update(const char *url)
+{
     if (ota_in_progress) {
         ESP_LOGE(TAG, "OTA update already in progress");
         return;
     }
 
     ota_in_progress = true;
-    ota_progress = 0;
-
     ESP_LOGI(TAG, "Starting OTA update from URL: %s", url);
 
-    esp_http_client_config_t config = {
-        .url = url,
-        .timeout_ms = 40000,
-    };
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == NULL) {
-        ESP_LOGE(TAG, "Failed to initialise HTTP connection");
-        goto ota_end;
+    // Check and fix OTA state before starting
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t ota_state;
+    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
+        if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+            ESP_LOGI(TAG, "Current firmware in pending verify state, marking as valid");
+            esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to mark current firmware as valid: %s", esp_err_to_name(err));
+                esp_mqtt_client_publish(mqtt_client, MQTT_SYSTEM_OUTPUT_TOPIC, 
+                                       "{\"status\":\"ota_failed\",\"error\":\"cannot_validate_current_firmware\"}", 0, 1, 0);
+                goto ota_end;
+            }
+            ESP_LOGI(TAG, "Current firmware marked as valid, proceeding with OTA");
+        }
     }
 
-    esp_err_t err = esp_http_client_open(client, 0);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
-        esp_http_client_cleanup(client);
-        goto ota_end;
-    }
+    // Publish status
+    esp_mqtt_client_publish(mqtt_client, MQTT_SYSTEM_OUTPUT_TOPIC, 
+                           "{\"status\":\"ota_started\"}", 0, 1, 0);
 
-    esp_http_client_fetch_headers(client);
+    int retry_count = 0;
+    bool ota_success = false;
 
-    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
-    if (update_partition == NULL) {
-        ESP_LOGE(TAG, "Failed to find update partition");
-        esp_http_client_cleanup(client);
-        goto ota_end;
-    }
+    while (retry_count < OTA_MAX_RETRIES && !ota_success) {
+        if (retry_count > 0) {
+            ESP_LOGI(TAG, "OTA retry attempt %d/%d", retry_count + 1, OTA_MAX_RETRIES);
+            char retry_msg[128];
+            snprintf(retry_msg, sizeof(retry_msg), 
+                    "{\"status\":\"ota_retry\",\"attempt\":%d}", retry_count + 1);
+            esp_mqtt_client_publish(mqtt_client, MQTT_SYSTEM_OUTPUT_TOPIC, retry_msg, 0, 1, 0);
+            vTaskDelay(pdMS_TO_TICKS(OTA_RETRY_DELAY));
+        }
 
-    esp_ota_handle_t update_handle = 0;
-    err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
-        esp_http_client_cleanup(client);
-        goto ota_end;
-    }
+        // Enhanced HTTP client configuration
+        esp_http_client_config_t config = {
+            .url = url,
+            .event_handler = ota_http_event_handler,
+            .timeout_ms = 120000,  // Increased timeout to 2 minutes
+            .buffer_size = OTA_BUFFER_SIZE,
+            .buffer_size_tx = OTA_BUFFER_SIZE,
+            .keep_alive_enable = true,
+            .keep_alive_idle = 5,
+            .keep_alive_interval = 5,
+            .keep_alive_count = 3,
+        };
 
-    int data_read;
-    char ota_write_data[BUFFSIZE];
-    while ((data_read = esp_http_client_read(client, ota_write_data, BUFFSIZE)) > 0) {
-        err = esp_ota_write(update_handle, (const void *)ota_write_data, data_read);
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        if (client == NULL) {
+            ESP_LOGE(TAG, "Failed to initialize HTTP connection");
+            retry_count++;
+            continue;
+        }
+
+        esp_err_t err = esp_http_client_open(client, 0);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(err));
-            esp_ota_end(update_handle);
+            ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
             esp_http_client_cleanup(client);
+            retry_count++;
+            continue;
+        }
+
+        int content_length = esp_http_client_fetch_headers(client);
+        if (content_length < 0) {
+            ESP_LOGE(TAG, "Failed to fetch headers");
+            esp_http_client_cleanup(client);
+            retry_count++;
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Content-Length: %d bytes", content_length);
+
+        const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+        if (update_partition == NULL) {
+            ESP_LOGE(TAG, "Failed to find update partition");
+            esp_http_client_cleanup(client);
+            esp_mqtt_client_publish(mqtt_client, MQTT_SYSTEM_OUTPUT_TOPIC, 
+                                   "{\"status\":\"ota_failed\",\"error\":\"no_update_partition\"}", 0, 1, 0);
             goto ota_end;
         }
-        ota_progress += data_read;
-    }
 
-    if (data_read < 0) {
-        ESP_LOGE(TAG, "Error: SSL data read error");
-        esp_ota_end(update_handle);
+        ESP_LOGI(TAG, "Writing to partition subtype %d at offset 0x%lx, size: %lu",
+                 update_partition->subtype, update_partition->address, update_partition->size);
+
+        // Check if partition is large enough
+        if (content_length > 0 && (size_t)content_length > update_partition->size) {
+            ESP_LOGE(TAG, "Firmware size (%d) exceeds partition size (%lu)", 
+                     content_length, update_partition->size);
+            esp_http_client_cleanup(client);
+            esp_mqtt_client_publish(mqtt_client, MQTT_SYSTEM_OUTPUT_TOPIC, 
+                                   "{\"status\":\"ota_failed\",\"error\":\"firmware_too_large\"}", 0, 1, 0);
+            goto ota_end;
+        }
+
+        esp_ota_handle_t update_handle = 0;
+        err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
+            esp_http_client_cleanup(client);
+            retry_count++;
+            continue;
+        }
+
+        int data_read;
+        char ota_write_data[OTA_BUFFER_SIZE];
+        int total_bytes = 0;
+        int last_progress_report = 0;
+        bool download_success = true;
+        
+        while ((data_read = esp_http_client_read(client, ota_write_data, OTA_BUFFER_SIZE)) > 0) {
+            err = esp_ota_write(update_handle, (const void *)ota_write_data, data_read);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(err));
+                download_success = false;
+                break;
+            }
+            total_bytes += data_read;
+            
+            // Publish progress every 64KB
+            if (total_bytes - last_progress_report >= 65536) {
+                char progress_msg[128];
+                int progress_percent = content_length > 0 ? (total_bytes * 100) / content_length : 0;
+                snprintf(progress_msg, sizeof(progress_msg), 
+                        "{\"status\":\"ota_progress\",\"bytes\":%d,\"percent\":%d}", 
+                        total_bytes, progress_percent);
+                esp_mqtt_client_publish(mqtt_client, MQTT_SYSTEM_OUTPUT_TOPIC, progress_msg, 0, 1, 0);
+                last_progress_report = total_bytes;
+            }
+            
+            // Watchdog reset
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+
+        if (data_read < 0) {
+            ESP_LOGE(TAG, "Error: HTTP data read error, errno: %d", errno);
+            download_success = false;
+        }
+
+        if (!download_success) {
+            esp_ota_end(update_handle);
+            esp_http_client_cleanup(client);
+            retry_count++;
+            continue;
+        }
+
+        // Validate downloaded size
+        if (content_length > 0 && total_bytes != content_length) {
+            ESP_LOGE(TAG, "Downloaded size (%d) doesn't match content length (%d)", 
+                     total_bytes, content_length);
+            esp_ota_end(update_handle);
+            esp_http_client_cleanup(client);
+            retry_count++;
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Total bytes downloaded: %d", total_bytes);
+
+        err = esp_ota_end(update_handle);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(err));
+            esp_http_client_cleanup(client);
+            retry_count++;
+            continue;
+        }
+
+        err = esp_ota_set_boot_partition(update_partition);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
+            esp_http_client_cleanup(client);
+            retry_count++;
+            continue;
+        }
+
+        ESP_LOGI(TAG, "OTA update successful, total bytes: %d", total_bytes);
         esp_http_client_cleanup(client);
-        goto ota_end;
+        ota_success = true;
     }
 
-    err = esp_ota_end(update_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(err));
-        esp_http_client_cleanup(client);
-        goto ota_end;
+    if (ota_success) {
+        // Publish success and restart
+        esp_mqtt_client_publish(mqtt_client, MQTT_SYSTEM_OUTPUT_TOPIC, 
+                               "{\"status\":\"ota_success\",\"restarting\":true}", 0, 1, 0);
+        vTaskDelay(pdMS_TO_TICKS(2000)); // Wait for message to be sent
+        esp_restart();
+    } else {
+        // All retries failed
+        ESP_LOGE(TAG, "OTA update failed after %d attempts", OTA_MAX_RETRIES);
+        esp_mqtt_client_publish(mqtt_client, MQTT_SYSTEM_OUTPUT_TOPIC, 
+                               "{\"status\":\"ota_failed\",\"error\":\"max_retries_exceeded\"}", 0, 1, 0);
     }
-
-    err = esp_ota_set_boot_partition(update_partition);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
-        esp_http_client_cleanup(client);
-        goto ota_end;
-    }
-
-    ESP_LOGI(TAG, "OTA update successful, restarting...");
-    esp_http_client_cleanup(client);
-    esp_restart();
 
 ota_end:
     ota_in_progress = false;
-    ota_progress = 0;
 }
 
-
+// OTA task wrapper
+static void ota_task(void *pvParameter)
+{
+    char *url = (char *)pvParameter;
+    perform_ota_update(url);
+    free(url);
+    vTaskDelete(NULL);
+}
 
 // WiFi event handler
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
@@ -250,7 +406,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         
         // Publish status
         char response[64];
-        snprintf(response, sizeof(response), "{\"msg\":\"hello\"}");
+        snprintf(response, sizeof(response), "{\"type\":\"hello\", \"msg\":\"ready v-1\"}");
         msg_id = esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
         ESP_LOGI(TAG, "sent status publish, msg_id=%d", msg_id);
         break;
@@ -313,25 +469,38 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     }
                 }                    
                 else if (strcmp(command->valuestring, "ota-update") == 0) {
-                    // Handle OTA update
-                    cJSON *url = cJSON_GetObjectItemCaseSensitive(json, "url");
-                    if (cJSON_IsString(url) && (url->valuestring != NULL)) {
-                        char *url_copy = strdup(url->valuestring);
-                        if (url_copy != NULL) {
-                            // Start OTA in a separate task to avoid blocking MQTT
-                            xTaskCreate(
-                                (TaskFunction_t)perform_ota_update,
-                                "ota_task",
-                                8192,
-                                url_copy,
-                                5,
-                                NULL
-                            );
-                            ESP_LOGI(TAG, "OTA update task created for URL: %s", url_copy);
+                    if (ota_in_progress) {
+                        esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, 
+                                               "{\"status\":\"error\",\"message\":\"OTA already in progress\"}", 0, 1, 0);
+                        ESP_LOGE(TAG, "OTA update already in progress");
+                    } else {
+                        // Handle OTA update
+                        cJSON *url = cJSON_GetObjectItemCaseSensitive(json, "url");
+                        if (cJSON_IsString(url) && (url->valuestring != NULL)) {
+                            char *url_copy = strdup(url->valuestring);
+                            if (url_copy != NULL) {
+                                // Start OTA in a separate task
+                                BaseType_t result = xTaskCreate(
+                                    ota_task,
+                                    "ota_task",
+                                    16384,  // Increased stack size
+                                    url_copy,
+                                    5,
+                                    NULL
+                                );
+                                if (result == pdPASS) {
+                                    ESP_LOGI(TAG, "OTA update task created for URL: %s", url_copy);
+                                } else {
+                                    ESP_LOGE(TAG, "Failed to create OTA task");
+                                    free(url_copy);
+                                    esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, 
+                                                           "{\"status\":\"error\",\"message\":\"Failed to create OTA task\"}", 0, 1, 0);
+                                }
+                            }
                         }
                     }
                 }
-                else if (strcmp(command->valuestring, "reset") == 0) {
+                else if (strcmp(command->valuestring, "restart") == 0) {
                     // Reset ESP32
                     esp_restart();
                 }
@@ -339,59 +508,77 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     cJSON *value_f = cJSON_GetObjectItemCaseSensitive(json, "value");
                     cJSON *name_f = cJSON_GetObjectItemCaseSensitive(json, "name");
                     cJSON *type_f = cJSON_GetObjectItemCaseSensitive(json, "type");
-
+                    char response[128];
+                    
+                    
                     if (cJSON_IsString(name_f) && (name_f->valuestring != NULL) && cJSON_IsString(type_f) && (type_f->valuestring != NULL)) {
                         char *name = strdup(name_f->valuestring);
                         char *type = strdup(type_f->valuestring);
-
+                        
                         if (strcmp(type, "float") == 0 && cJSON_IsNumber(value_f)) {
                             float value = value_f->valuedouble;
                             set_setting(name, cJSON_CreateNumber(value));
                             ESP_LOGI(TAG, "Set %s to %f",name, value);
+                            snprintf(response, sizeof(response), "{\"msg\":\"Set %s to %f\"}", name, value);
                         }
                         else if (cJSON_IsString(value_f) && (value_f->valuestring != NULL) && strcmp(type, "string") == 0) {
                             char *value = value_f->valuestring;
                             set_setting(name, cJSON_CreateString(value));
                             ESP_LOGI(TAG, "Set %s to %s", name, value);
+                            snprintf(response, sizeof(response), "{\"msg\":\"Set %s to %s\"}", name, value);
                         } 
                         else if (cJSON_IsNumber(value_f) && strcmp(type, "int") == 0) {
                             int value = value_f->valueint;
                             set_setting(name, cJSON_CreateNumber(value));
                             ESP_LOGI(TAG, "Set %s to %d", name, value);
+                            snprintf(response, sizeof(response), "{\"msg\":\"Set %s to %d\"}", name, value);
                         }else{
                             ESP_LOGE(TAG, "Invalid value type");
+                            snprintf(response, sizeof(response), "{\"msg\":\"Invalid value type\"}");
                         }
                         
                         free(name);
                         free(type);
+                    } else {
+                        snprintf(response, sizeof(response), "{\"msg\":\"error\"}");
                     }
+                    esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
                 }
                 else if (strcmp(command->valuestring, "get-coeff") == 0) {
                     cJSON *type_f = cJSON_GetObjectItemCaseSensitive(json, "type");
                     cJSON *name_f = cJSON_GetObjectItemCaseSensitive(json, "name");
+                    char response[128];
                     if (cJSON_IsString(name_f) && (name_f->valuestring != NULL) && cJSON_IsString(type_f) && (type_f->valuestring != NULL)) {
                         char *name = strdup(name_f->valuestring);
                         char *type = strdup(type_f->valuestring);
                         if (strcmp(type, "float") == 0) {
                             float value = get_float_setting(name, -1.0f);
                             ESP_LOGI(TAG, "Value of %s: %f\n", name, value);
+                            snprintf(response, sizeof(response), "{\"msg\":\"Value of %s: %f\"}", name, value);
                         }
                         else if (strcmp(type, "string") == 0) {
                             char value[MAX_STR_LEN];
                             if (get_string_setting(name, value, sizeof(value)) == ESP_OK) {
                                 ESP_LOGI(TAG, "Value of %s: %s\n", name, value);
+                                snprintf(response, sizeof(response), "{\"msg\":\"Value of %s: %s\"}", name, value);
                             } else {
                                 ESP_LOGE(TAG, "Failed to get string setting %s", name);
+                                snprintf(response, sizeof(response), "{\"msg\":\"Failed to get string setting %s\"}", name);
                             }
                         } 
                         else if (strcmp(type, "int") == 0) {
                             int value = get_int_setting(name, -1);
                             ESP_LOGI(TAG, "Value of %s: %d\n", name, value);
+                            snprintf(response, sizeof(response), "{\"msg\":\"Value of %s: %d\"}", name, value);
+                        } else {
+                            snprintf(response, sizeof(response), "{\"msg\":\"Invalid value type\"}");
                         }
-                        
                         free(name);
                         free(type);
+                    } else {
+                        snprintf(response, sizeof(response), "{\"msg\":\"error\"}");
                     }
+                    esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
                 }
                 else if (strcmp(command->valuestring, "test-movement") == 0) {
                     char *code = strdup("from test_robot_lib import test\ntest()");
@@ -440,6 +627,23 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 else if (strcmp(command->valuestring, "battery-status") == 0) {
                     set_measure_adc_flag(true);
                 }
+                else if (strcmp(command->valuestring, "mark-valid") == 0) {
+                    // Mark current firmware as valid
+                    esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+                    if (err == ESP_OK) {
+                        esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, 
+                                               "{\"status\":\"success\",\"message\":\"Firmware marked as valid\"}", 0, 1, 0);
+                        ESP_LOGI(TAG, "Firmware marked as valid");
+                    } else {
+                        char error_msg[128];
+                        snprintf(error_msg, sizeof(error_msg), 
+                                "{\"status\":\"error\",\"message\":\"Failed to mark valid: %s\"}", 
+                                esp_err_to_name(err));
+                        esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, error_msg, 0, 1, 0);
+                        ESP_LOGE(TAG, "Failed to mark firmware as valid: %s", esp_err_to_name(err));
+                    }
+                }
+                
             }
             
             cJSON_Delete(json);
@@ -526,6 +730,24 @@ static void wifi_init_sta()
 // MQTT task running on core 1
 void mqtt_task(void *pvParameter) {
     ESP_LOGI(TAG, "Starting MQTT task on core %d", xPortGetCoreID());
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    ESP_LOGI(TAG, "Running partition: %s at 0x%lx", running->label, running->address);
+
+    // Check OTA state and mark as valid if needed
+    esp_ota_img_states_t ota_state;
+    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
+        ESP_LOGI(TAG, "Current OTA state: %d", ota_state);
+        if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+            ESP_LOGI(TAG, "Pending verification detected, marking current firmware as valid");
+            esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "Current firmware marked as valid");
+            } else {
+                ESP_LOGE(TAG, "Failed to mark firmware as valid: %s", esp_err_to_name(err));
+            }
+        }
+    }
     
     // Initialize WiFi
     wifi_init_sta();

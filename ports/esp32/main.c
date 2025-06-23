@@ -108,7 +108,7 @@ void MICROPY_ESP_IDF_ENTRY(void) {
     esp_log_level_set("transport", ESP_LOG_VERBOSE);
     esp_log_level_set("outbox", ESP_LOG_VERBOSE);
 
-    print_all_settings();
+   // print_all_settings();
 
     // Hook for a board to run code at start up.
     MICROPY_BOARD_STARTUP();

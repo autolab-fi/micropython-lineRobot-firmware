@@ -1,2 +1,2 @@
-from measure_adc import measure
-measure()
+from measure_adc import measure_print
+measure_print()
