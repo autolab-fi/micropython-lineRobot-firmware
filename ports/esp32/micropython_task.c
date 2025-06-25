@@ -194,12 +194,15 @@ soft_reset:
                 received_code = NULL;
             }
             py_code = "";
-            goto soft_reset;
+            ESP_LOGI(TAG, "Python code executed successfully");
+
+            goto soft_reset_exit;
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
 soft_reset_exit:
+    ESP_LOGI(TAG, "Resetting cached Python code");
 
     #if MICROPY_BLUETOOTH_NIMBLE
     mp_bluetooth_deinit();

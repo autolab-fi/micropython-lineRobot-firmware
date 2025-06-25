@@ -11,7 +11,4 @@ def measure():
    
 def measure_print():
    v1, v2 = measure()
-   ch = 'false'
-   if v2>5:
-      ch='true'
-   print(f"SYS{{'voltage': {v1}, 'charging': {v2}}}")
+   print(f'SYS{{"voltage": {v1}, "charging": {v2}}}')

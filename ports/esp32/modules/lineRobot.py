@@ -24,6 +24,8 @@ class Robot:
         
         # Инициализация состояния
         self._init_state()
+        # Инициалищация interrupt
+        self.begin()
     
     def _load_config(self):
         # Значения по умолчанию

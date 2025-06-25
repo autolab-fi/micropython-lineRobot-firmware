@@ -57,7 +57,7 @@ static bool ota_in_progress = false;
 static int ota_progress = 0;
 
 // Watchdog variables
-#define WDT_TIMEOUT_SEC 10  // 10 seconds watchdog timeout
+#define WDT_TIMEOUT_SEC 20  // 20 seconds watchdog timeout
 
 
 char* escape_json_string(const char* input) {
@@ -109,12 +109,15 @@ static void init_watchdog() {
         .idle_core_mask = (1 << portNUM_PROCESSORS) - 1, // Watch all cores
         .trigger_panic = true
     };
-    esp_task_wdt_init(&wdt_config);
+    ESP_LOGI(TAG, "Watchdog 1 initialized with %d second timeout", WDT_TIMEOUT_SEC);
+    esp_task_wdt_reconfigure(&wdt_config);
+
     esp_task_wdt_add(NULL); // Add current task to watchdog
-    ESP_LOGI(TAG, "Watchdog initialized with %d second timeout", WDT_TIMEOUT_SEC);
+    ESP_LOGI(TAG, "Watchdog 2 initialized with %d second timeout", WDT_TIMEOUT_SEC);
 }
 // Reset watchdog timer
 static void reset_watchdog() {
+   // ESP_LOGI(TAG, "Watchdog reset");
     esp_task_wdt_reset();
 }
 
@@ -406,7 +409,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         
         // Publish status
         char response[64];
-        snprintf(response, sizeof(response), "{\"type\":\"hello\", \"msg\":\"ready v-1\"}");
+        snprintf(response, sizeof(response), "{\"type\":\"hello\", \"msg\":\"fixed watchdog\"}");
         msg_id = esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
         ESP_LOGI(TAG, "sent status publish, msg_id=%d", msg_id);
         break;
@@ -788,7 +791,8 @@ void mqtt_task(void *pvParameter) {
     
     while (1) {
         reset_watchdog();
-        
+        // check watchdog
+        //vTaskDelay(pdMS_TO_TICKS(15000));
         // Handle MQTT print stream
         received_len = xStreamBufferReceive(
             mqtt_print_stream,

@@ -131,14 +131,16 @@ void MICROPY_ESP_IDF_ENTRY(void) {
    // watchdog_init();
    uart_handler_init();
 
-    // Create MicroPython task on core 0
-    xTaskCreatePinnedToCore(mp_task, "mp_task", 
-        MICROPY_TASK_STACK_SIZE / sizeof(StackType_t), 
-        NULL, MP_TASK_PRIORITY, &mp_main_task_handle, 0);
+    
     
     // Create MQTT task on core 1
     xTaskCreatePinnedToCore(mqtt_task, "mqtt_task", 
         8192, NULL, MQTT_TASK_PRIORITY, NULL, 1);
+
+    // Create MicroPython task on core 0
+    xTaskCreatePinnedToCore(mp_task, "mp_task", 
+        MICROPY_TASK_STACK_SIZE / sizeof(StackType_t), 
+        NULL, MP_TASK_PRIORITY, &mp_main_task_handle, 0);
     
     xTaskCreatePinnedToCore(uart_handler_task, "uart_task", 
         4096, NULL, WATCHDOG_TASK_PRIORITY, NULL, 1);
