@@ -259,49 +259,6 @@ Octoliner(i2c_address=42)
 
 ### Example 1: Basic Line Following Robot
 
-```python
-from machine import I2C, Pin, PWM
-from octoliner import Octoliner
-import time
-
-# Setup hardware
-i2c = I2C(0, scl=Pin(22), sda=Pin(21))
-sensor = Octoliner()
-sensor.begin(i2c)
-
-# Motor setup (example pins)
-left_motor = PWM(Pin(18))
-right_motor = PWM(Pin(19))
-left_motor.freq(1000)
-right_motor.freq(1000)
-
-# Calibrate
-sensor.optimize_sensitivity_on_black()
-
-def set_motors(left_speed, right_speed):
-    """Set motor speeds (-100 to 100)"""
-    left_motor.duty(int(abs(left_speed) * 10.23))
-    right_motor.duty(int(abs(right_speed) * 10.23))
-
-# Main loop
-while True:
-    position = sensor.track_line()
-    
-    if not math.isnan(position):
-        # PID-like control
-        base_speed = 50
-        turn_rate = position * 30
-        
-        left_speed = base_speed - turn_rate
-        right_speed = base_speed + turn_rate
-        
-        set_motors(left_speed, right_speed)
-    else:
-        # No line detected - stop
-        set_motors(0, 0)
-    
-    time.sleep(0.05)
-```
 
 ### Example 2: Intersection Detection
 
