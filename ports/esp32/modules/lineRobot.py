@@ -11,7 +11,7 @@ class Robot:
 
         # Загружаем конфиг из файла или используем значения по умолчанию
         config = self._load_config()
-        print(f"config: {config['version']}")
+        #print(f"config: {config['version']}")
         
         # Обновляем конфиг переданными аргументами
         config.update(kwargs)
@@ -26,6 +26,7 @@ class Robot:
         self._init_state()
         # Инициалищация interrupt
         self.begin()
+        self.debug = 0
     
     def _load_config(self):
         # Значения по умолчанию
@@ -51,7 +52,8 @@ class Robot:
             "kdsr": 0.1,
             "kis": 0.0,
             "ks": 80.0,
-            "maxs": 15.0
+            "maxs": 15.0,
+            "debug": 0
         }
         try:
             #print("loading params from the memory")
@@ -82,6 +84,8 @@ class Robot:
         self.kd_speed_right = config["kdsr"]
         self.ki_speed = config["kis"]
         self.k_straight = config["ks"]
+        self.debug = config["debug"]
+        self.time_to_msg = time.ticks_ms()
     
     def _init_hardware(self, config):
         # Motor pins
@@ -89,6 +93,10 @@ class Robot:
         self.in2 = PWM(Pin(config["pml2"]), freq=1000)
         self.in3 = PWM(Pin(config["pmr1"]), freq=1000)
         self.in4 = PWM(Pin(config["pmr2"]), freq=1000)
+        self.in1.duty(0)
+        self.in2.duty(0)
+        self.in3.duty(0)
+        self.in4.duty(0)
         
         # Encoder pins
         self.encoder_pin_a_left = Pin(config["pel1"], Pin.IN)
@@ -161,7 +169,7 @@ class Robot:
     
     def run_motor_left(self, u):
         """Run left motor with PWM value u (-1023 to 1023)"""
-        u = self.constrain(u, -1023, 1023)
+        u = self.constrain(u, -1000, 1000)
         if u < 0:
             self.in1.duty(0)
             self.in2.duty(-u)
@@ -171,7 +179,7 @@ class Robot:
     
     def run_motor_right(self, u):
         """Run right motor with PWM value u (-1023 to 1023)"""
-        u = self.constrain(u, -1023, 1023)
+        u = self.constrain(u, -1000, 1000)
         if u < 0:
             self.in3.duty(0)
             self.in4.duty(-u)
@@ -193,6 +201,14 @@ class Robot:
         """Stop both motors"""
         self.stop_motor_left()
         self.stop_motor_right()
+        self.left_motor_signal = 0
+        self.right_motor_signal = 0
+        self.reset_regulators()
+        self.reset_encoders()
+        if self.debug:
+            print("Robot stopped")
+        time.sleep_ms(30)
+
     
     def encoder_degrees_left(self):
         """Get left encoder position in degrees"""
@@ -228,7 +244,7 @@ class Robot:
         delta_time = interval / 1000.0
         return delta_pos / delta_time
     
-    def get_speed_motors(self, interval=50):
+    def get_speed_motors(self, interval=70):
         """Get both wheel speeds in rad/s"""
         last_pos_l = self.encoder_radian_left()
         last_pos_r = self.encoder_radian_right()
@@ -291,12 +307,18 @@ class Robot:
         return motor_speed, integral, err, current_time
     
     def run_motors_speed(self, speed_left, speed_right):
+
         """Run motors at specified speeds (percentage)"""
+
+        if time.ticks_diff(time.ticks_ms(), self.time_to_msg) > 1000 and self.debug:
+                print(f"Left speed: {speed_left:.2f}, Right speed: {speed_right:.2f}")
+                self.time_to_msg = time.ticks_ms()
         speed_left = self.constrain(speed_left, -100, 100)
         speed_right = self.constrain(speed_right, -100, 100)
         
-        cur_speed_l, cur_speed_r = self.get_speed_motors(50)
         
+        cur_speed_l, cur_speed_r = self.get_speed_motors(50)
+
         target_speed_l = speed_left * self.k_speed_radians
         target_speed_r = speed_right * self.k_speed_radians
         
@@ -321,11 +343,12 @@ class Robot:
     def reset_regulators(self):
         """Reset PID controllers"""
         current_time = time.ticks_ms()
-        self.last_time_left_speed = current_time + 3
-        self.last_time_right_speed = current_time + 3
-        self.last_time_left = current_time + 2
-        self.last_time_right = current_time + 2
-        
+        self.last_time_left_speed = current_time
+        self.last_time_right_speed = current_time
+        self.last_time_left = current_time 
+        self.last_time_right = current_time
+
+        # Reset all integral and error terms
         self.integral_speed_left = 0
         self.previous_err_speed_left = 0
         self.integral_speed_right = 0
@@ -335,6 +358,10 @@ class Robot:
         self.previous_err_ang_left = 0
         self.integral_ang_right = 0
         self.previous_err_ang_right = 0
+        
+        # Reset target angle
+        self.target_angle = 0
+
     
     def reset_encoders(self):
         """Reset encoder positions"""
@@ -351,9 +378,10 @@ class Robot:
             return
             
         # Calculate target angle
-        self.target_angle = dist / self.RADIUS_WHEEL * 1.02
         self.reset_encoders()
         self.reset_regulators()
+        self.target_angle = dist / self.RADIUS_WHEEL * 1.02
+        time.sleep_ms(50)
         
         angle_left = 0.0
         angle_right = 0.0
@@ -363,14 +391,16 @@ class Robot:
         
         self.previous_err_ang_left = self.target_angle
         self.previous_err_ang_right = self.target_angle
-        
+        c = 0
         while ((abs(self.target_angle - angle_left) > 0.2 or 
                 abs(self.target_angle - angle_right) > 0.2) and 
                time.ticks_diff(time.ticks_ms(), start_time) < period):
             
             angle_left = self.encoder_radian_left()
             angle_right = self.encoder_radian_right()
-            
+            if c % 10 == 0 and self.debug:
+                print(f"Target: {self.target_angle:.2f}, Left: {angle_left:.2f}, Right: {angle_right:.2f}, integralL: {self.integral_ang_left:.2f}, integralR: {self.integral_ang_right:.2f}, prevErrL: {self.previous_err_ang_left:.2f}, prevErrR: {self.previous_err_ang_right:.2f}")
+                c+=1
             # PID control for both motors
             left_motor_speed, self.integral_ang_left, self.previous_err_ang_left, self.last_time_left = \
                 self.compute_pid_angle_motor(self.target_angle - angle_left, self.kp_ang, 
@@ -388,7 +418,13 @@ class Robot:
             
             # Smooth start
             elapsed = time.ticks_diff(time.ticks_ms(), start_time)
-            if elapsed < 500:
+
+            if elapsed < 800:
+                power = self.constrain(0.5 + elapsed / 1000.0, 0.5, 1.0)
+                left_motor_speed = int(left_motor_speed * power)
+                right_motor_speed = int(right_motor_speed * power)
+
+            if elapsed < 800:
                 power = self.constrain(0.5 + elapsed / 1000.0, 0.5, 1.0)
                 left_motor_speed = int(left_motor_speed * power)
                 right_motor_speed = int(right_motor_speed * power)
@@ -398,7 +434,7 @@ class Robot:
                 right_motor_speed += int((angle_left - angle_right) * self.k_straight)
             elif abs(self.previous_err_ang_left) > abs(self.previous_err_ang_right):
                 left_motor_speed += int((angle_right - angle_left) * self.k_straight)
-            
+
             self.run_motors_speed(left_motor_speed, right_motor_speed)
         
         self.stop()
@@ -408,9 +444,9 @@ class Robot:
         if self.block:
             return
             
-        self.target_angle = dist / self.RADIUS_WHEEL * 1.02
         self.reset_encoders()
         self.reset_regulators()
+        self.target_angle = dist / self.RADIUS_WHEEL * 1.02
         
         angle_left = 0.0
         angle_right = 0.0
@@ -455,7 +491,6 @@ class Robot:
                 left_motor_speed += int((angle_right - angle_left) * self.k_straight)
             
             self.run_motors_speed(-left_motor_speed, -right_motor_speed)
-        
         self.stop()
     
     def move_forward_distance(self, dist):
@@ -497,7 +532,6 @@ class Robot:
                 left_motor_speed += int((angle_right - angle_left) * self.k_straight)
             
             self.run_motors_speed(left_motor_speed, right_motor_speed)
-        
         self.stop()
     
     def move_backward_seconds(self, seconds):
@@ -531,7 +565,6 @@ class Robot:
                 left_motor_speed += int((angle_right - angle_left) * self.k_straight)
             
             self.run_motors_speed(-left_motor_speed, -right_motor_speed)
-        
         self.stop()
     
     def turn_left_angle(self, angle):
@@ -587,7 +620,6 @@ class Robot:
             final_left = int(-left_motor_speed * self.STANDARD_SPEED_PERCENTAGE / 100.0)
             final_right = int(right_motor_speed * self.STANDARD_SPEED_PERCENTAGE / 100.0)
             self.run_motors_speed(final_left, final_right)
-        
         self.stop()
         time.sleep_ms(500)
         
@@ -644,7 +676,6 @@ class Robot:
             final_left = int(left_motor_speed * self.STANDARD_SPEED_PERCENTAGE / 100.0)
             final_right = int(-right_motor_speed * self.STANDARD_SPEED_PERCENTAGE / 100.0)
             self.run_motors_speed(final_left, final_right)
-        
         self.stop()
         time.sleep_ms(500)
     
