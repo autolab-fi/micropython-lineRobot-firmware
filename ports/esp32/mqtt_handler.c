@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -49,6 +50,86 @@ static const char *TAG = "mqtt_handler";
 // External flag for ADC measurement
 extern bool get_measure_adc_flag(void);
 extern void set_measure_adc_flag(bool value);
+
+
+typedef struct mqtt_partial_msg {
+    char *topic;
+    int topic_len;
+    char *buffer;
+    int total_len;
+    int received_len;
+    struct mqtt_partial_msg *next;
+} mqtt_partial_msg_t;
+
+static mqtt_partial_msg_t *partial_messages = NULL;
+
+static char *mqtt_strndup(const char *src, size_t len) {
+    char *dst = malloc(len + 1);
+    if (!dst) {
+        return NULL;
+    }
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+    return dst;
+}
+
+static mqtt_partial_msg_t *find_partial_message(const char *topic, int topic_len) {
+    mqtt_partial_msg_t *current = partial_messages;
+    while (current) {
+        if (current->topic_len == topic_len && strncmp(current->topic, topic, topic_len) == 0) {
+            return current;
+        }
+        current = current->next;
+    }
+    return NULL;
+}
+
+static void remove_partial_message(mqtt_partial_msg_t *message) {
+    if (!message) {
+        return;
+    }
+
+    mqtt_partial_msg_t **current = &partial_messages;
+    while (*current) {
+        if (*current == message) {
+            *current = message->next;
+            free(message->buffer);
+            free(message->topic);
+            free(message);
+            return;
+        }
+        current = &(*current)->next;
+    }
+}
+
+static mqtt_partial_msg_t *create_partial_message(const char *topic, int topic_len, int total_len) {
+    mqtt_partial_msg_t *message = malloc(sizeof(mqtt_partial_msg_t));
+    if (!message) {
+        return NULL;
+    }
+
+    message->topic = mqtt_strndup(topic, topic_len);
+    if (!message->topic) {
+        free(message);
+        return NULL;
+    }
+
+    message->buffer = malloc(total_len + 1);
+    if (!message->buffer) {
+        free(message->topic);
+        free(message);
+        return NULL;
+    }
+
+    message->topic_len = topic_len;
+    message->total_len = total_len;
+    message->received_len = 0;
+    message->buffer[0] = '\0';
+    message->next = partial_messages;
+    partial_messages = message;
+
+    return message;
+}
 
 
 
@@ -430,22 +511,77 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
         break;
         
-    case MQTT_EVENT_DATA:
+    case MQTT_EVENT_DATA: {
         ESP_LOGI(TAG, "MQTT_EVENT_DATA");
         printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
         printf("DATA=%.*s\r\n", event->data_len, event->data);
-        
+
+        bool is_fragmented = event->total_data_len > event->data_len || event->current_data_offset != 0;
+        mqtt_partial_msg_t *message = NULL;
+        mqtt_partial_msg_t *completed_message = NULL;
+        const char *payload = NULL;
+        int payload_len = 0;
+
+        if (is_fragmented) {
+            int total_len = event->total_data_len > 0 ? event->total_data_len : event->data_len;
+            message = find_partial_message(event->topic, event->topic_len);
+
+            if (event->current_data_offset == 0) {
+                if (message) {
+                    ESP_LOGW(TAG, "Discarding unfinished message for topic %.*s due to new transmission", event->topic_len, event->topic);
+                    remove_partial_message(message);
+                }
+                message = create_partial_message(event->topic, event->topic_len, total_len);
+                if (!message) {
+                    ESP_LOGE(TAG, "Failed to allocate buffer for multipart MQTT message");
+                    break;
+                }
+                ESP_LOGI(TAG, "Receiving multipart MQTT message for topic %s (%d bytes expected)", message->topic, message->total_len);
+            } else if (!message) {
+                ESP_LOGE(TAG, "Received MQTT message fragment with no buffer (topic %.*s)", event->topic_len, event->topic);
+                break;
+            }
+
+            if (message->total_len < event->current_data_offset + event->data_len) {
+                ESP_LOGE(TAG, "MQTT fragment overflow for topic %s: offset=%d len=%d total=%d", message->topic, event->current_data_offset, event->data_len, message->total_len);
+                remove_partial_message(message);
+                break;
+            }
+
+            memcpy(message->buffer + event->current_data_offset, event->data, event->data_len);
+            message->received_len = event->current_data_offset + event->data_len;
+            ESP_LOGD(TAG, "Received MQTT fragment for topic %s: offset=%d len=%d total=%d", message->topic, event->current_data_offset, event->data_len, message->total_len);
+
+            if (message->received_len < message->total_len) {
+                ESP_LOGI(TAG, "Waiting for more MQTT fragments for topic %s (%d/%d)", message->topic, message->received_len, message->total_len);
+                break;
+            }
+
+            message->buffer[message->total_len] = '\0';
+            completed_message = message;
+            payload = message->buffer;
+            payload_len = message->total_len;
+            ESP_LOGI(TAG, "Completed multipart MQTT message for topic %s (%d bytes)", message->topic, message->total_len);
+        } else {
+            payload = event->data;
+            payload_len = event->data_len;
+        }
+
         // Process JSON commands
         if (strncmp(event->topic, MQTT_SYSTEM_INPUT_TOPIC, event->topic_len) == 0) {
-            cJSON *json = cJSON_ParseWithLength(event->data, event->data_len);
+            cJSON *json = cJSON_ParseWithLength(payload, payload_len);
             if (json == NULL) {
                 const char *error_ptr = cJSON_GetErrorPtr();
                 if (error_ptr != NULL) {
                     ESP_LOGE(TAG, "JSON parse error before: %s", error_ptr);
                 }
+                if (completed_message) {
+                    remove_partial_message(completed_message);
+                    completed_message = NULL;
+                }
                 break;
             }
-            
+
             // Handle ping command
             cJSON *command = cJSON_GetObjectItemCaseSensitive(json, "command");
             if (cJSON_IsString(command) && (command->valuestring != NULL)) {
@@ -470,10 +606,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                             }
                         }
                     }
-                }                    
+                }
                 else if (strcmp(command->valuestring, "ota-update") == 0) {
                     if (ota_in_progress) {
-                        esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, 
+                        esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC,
                                                "{\"status\":\"error\",\"message\":\"OTA already in progress\"}", 0, 1, 0);
                         ESP_LOGE(TAG, "OTA update already in progress");
                     } else {
@@ -496,7 +632,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                 } else {
                                     ESP_LOGE(TAG, "Failed to create OTA task");
                                     free(url_copy);
-                                    esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, 
+                                    esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC,
                                                            "{\"status\":\"error\",\"message\":\"Failed to create OTA task\"}", 0, 1, 0);
                                 }
                             }
@@ -646,13 +782,18 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                         ESP_LOGE(TAG, "Failed to mark firmware as valid: %s", esp_err_to_name(err));
                     }
                 }
-                
+
             }
-            
+
             cJSON_Delete(json);
         }
+
+        if (completed_message) {
+            remove_partial_message(completed_message);
+        }
         break;
-        
+    }
+
     case MQTT_EVENT_ERROR:
         ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
         break;
