@@ -56,6 +56,9 @@ extern void set_measure_adc_flag(bool value);
 static bool ota_in_progress = false;
 static int ota_progress = 0;
 
+// Forward declarations
+static void ota_task(void *pvParameter);
+
 // Watchdog variables
 #define WDT_TIMEOUT_SEC 20  // 20 seconds watchdog timeout
 
