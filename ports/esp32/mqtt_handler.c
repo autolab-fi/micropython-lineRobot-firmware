@@ -74,6 +74,8 @@ typedef struct {
 
 static partial_message_t partial_messages[MAX_PARTIAL_MESSAGES];
 
+static void ota_task(void *pvParameter);
+
 static void reset_partial_message(partial_message_t *message) {
     if (!message) {
         return;
@@ -86,6 +88,14 @@ static void reset_partial_message(partial_message_t *message) {
         free(message->buffer);
     }
     memset(message, 0, sizeof(*message));
+}
+
+static void reset_all_partial_messages(void) {
+    for (size_t i = 0; i < MAX_PARTIAL_MESSAGES; i++) {
+        if (partial_messages[i].in_use) {
+            reset_partial_message(&partial_messages[i]);
+        }
+    }
 }
 
 static partial_message_t *find_partial_message(int msg_id, const char *topic, size_t topic_len) {
@@ -755,6 +765,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+        reset_all_partial_messages();
         break;
 
     case MQTT_EVENT_SUBSCRIBED:
@@ -851,6 +862,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     }
     case MQTT_EVENT_ERROR:
         ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
+        reset_all_partial_messages();
         break;
         
     default:
