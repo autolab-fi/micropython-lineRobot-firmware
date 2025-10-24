@@ -217,6 +217,11 @@ void uart_handler_task(void* pvParameter) {
         if (length > 0) {
             // Process received data
             for (int i = 0; i < length; i++) {
+                // Ignore carriage returns so CRLF line endings do not pollute commands
+                if (data[i] == '\r') {
+                    continue;
+                }
+
                 // Check for command terminator (newline or semicolon)
                 if (data[i] == '\n' || data[i] == ';') {
                     // Null-terminate the command
