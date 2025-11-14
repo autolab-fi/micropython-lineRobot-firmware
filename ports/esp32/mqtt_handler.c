@@ -60,6 +60,355 @@ static int ota_progress = 0;
 #define WDT_TIMEOUT_SEC 20  // 20 seconds watchdog timeout
 
 
+#define MAX_PARTIAL_MESSAGES 4
+
+typedef struct {
+    bool in_use;
+    int msg_id;
+    char *topic;
+    size_t topic_len;
+    char *buffer;
+    size_t total_len;
+    size_t received_len;
+} partial_message_t;
+
+static partial_message_t partial_messages[MAX_PARTIAL_MESSAGES];
+
+static void ota_task(void *pvParameter);
+
+static void reset_partial_message(partial_message_t *message) {
+    if (!message) {
+        return;
+    }
+
+    if (message->topic) {
+        free(message->topic);
+    }
+    if (message->buffer) {
+        free(message->buffer);
+    }
+    memset(message, 0, sizeof(*message));
+}
+
+static void reset_all_partial_messages(void) {
+    for (size_t i = 0; i < MAX_PARTIAL_MESSAGES; i++) {
+        if (partial_messages[i].in_use) {
+            reset_partial_message(&partial_messages[i]);
+        }
+    }
+}
+
+static partial_message_t *find_partial_message(int msg_id, const char *topic, size_t topic_len) {
+    for (size_t i = 0; i < MAX_PARTIAL_MESSAGES; i++) {
+        partial_message_t *message = &partial_messages[i];
+        if (!message->in_use) {
+            continue;
+        }
+        if (message->msg_id == msg_id) {
+            return message;
+        }
+        if (topic && message->topic && message->topic_len == topic_len && strncmp(message->topic, topic, topic_len) == 0) {
+            return message;
+        }
+    }
+    return NULL;
+}
+
+static partial_message_t *start_partial_message(int msg_id, const char *topic, size_t topic_len, size_t total_len) {
+    partial_message_t *message = find_partial_message(msg_id, topic, topic_len);
+    if (message) {
+        reset_partial_message(message);
+    } else {
+        for (size_t i = 0; i < MAX_PARTIAL_MESSAGES; i++) {
+            if (!partial_messages[i].in_use) {
+                message = &partial_messages[i];
+                break;
+            }
+        }
+    }
+
+    if (!message) {
+        ESP_LOGE(TAG, "No available slots for multipart MQTT message");
+        return NULL;
+    }
+
+    message->buffer = malloc(total_len + 1);
+    if (!message->buffer) {
+        ESP_LOGE(TAG, "Failed to allocate buffer for multipart MQTT message");
+        return NULL;
+    }
+
+    if (topic && topic_len > 0) {
+        message->topic = malloc(topic_len + 1);
+        if (!message->topic) {
+            ESP_LOGE(TAG, "Failed to allocate topic buffer for multipart MQTT message");
+            free(message->buffer);
+            message->buffer = NULL;
+            return NULL;
+        }
+        memcpy(message->topic, topic, topic_len);
+        message->topic[topic_len] = '\0';
+        message->topic_len = topic_len;
+    } else {
+        message->topic = NULL;
+        message->topic_len = 0;
+    }
+
+    message->total_len = total_len;
+    message->received_len = 0;
+    message->msg_id = msg_id;
+    message->in_use = true;
+    memset(message->buffer, 0, total_len + 1);
+
+    return message;
+}
+
+static void complete_partial_message(partial_message_t *message) {
+    if (!message) {
+        return;
+    }
+    reset_partial_message(message);
+}
+
+static bool topic_matches(const char *topic, int topic_len, const char *expected) {
+    if (!topic || topic_len <= 0 || !expected) {
+        return false;
+    }
+
+    size_t expected_len = strlen(expected);
+    if ((size_t)topic_len != expected_len) {
+        return false;
+    }
+
+    return strncmp(topic, expected, expected_len) == 0;
+}
+
+static void process_system_input_message(esp_mqtt_client_handle_t client, const char *data, int data_len) {
+    if (!data || data_len <= 0) {
+        ESP_LOGW(TAG, "Empty MQTT payload on system input topic");
+        return;
+    }
+
+    cJSON *json = cJSON_ParseWithLength(data, data_len);
+    if (json == NULL) {
+        const char *error_ptr = cJSON_GetErrorPtr();
+        if (error_ptr != NULL) {
+            ESP_LOGE(TAG, "JSON parse error before: %s", error_ptr);
+        }
+        return;
+    }
+
+    cJSON *command = cJSON_GetObjectItemCaseSensitive(json, "command");
+    if (cJSON_IsString(command) && (command->valuestring != NULL)) {
+        if (strcmp(command->valuestring, "ping") == 0) {
+            char response[64];
+            snprintf(response, sizeof(response), "{\"msg\":\"pong\"}");
+            esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
+            ESP_LOGI(TAG, "Responded to ping command");
+        } else if (strcmp(command->valuestring, "py") == 0) {
+            cJSON *value = cJSON_GetObjectItemCaseSensitive(json, "value");
+            if (cJSON_IsString(value) && (value->valuestring != NULL)) {
+                char *code_copy = strdup(value->valuestring);
+                if (code_copy != NULL) {
+                    if (xQueueSend(python_code_queue, &code_copy, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                        ESP_LOGE(TAG, "Failed to send Python code to queue");
+                        free(code_copy);
+                    } else {
+                        ESP_LOGI(TAG, "Python code sent to execution queue: %s", code_copy);
+                    }
+                }
+            }
+        } else if (strcmp(command->valuestring, "ota-update") == 0) {
+            if (ota_in_progress) {
+                esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC,
+                                       "{\"status\":\"error\",\"message\":\"OTA already in progress\"}", 0, 1, 0);
+                ESP_LOGE(TAG, "OTA update already in progress");
+            } else {
+                cJSON *url = cJSON_GetObjectItemCaseSensitive(json, "url");
+                if (cJSON_IsString(url) && (url->valuestring != NULL)) {
+                    char *url_copy = strdup(url->valuestring);
+                    if (url_copy != NULL) {
+                        BaseType_t result = xTaskCreate(
+                            ota_task,
+                            "ota_task",
+                            16384,
+                            url_copy,
+                            5,
+                            NULL
+                        );
+                        if (result == pdPASS) {
+                            ESP_LOGI(TAG, "OTA update task created for URL: %s", url_copy);
+                        } else {
+                            ESP_LOGE(TAG, "Failed to create OTA task");
+                            free(url_copy);
+                            esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC,
+                                                   "{\"status\":\"error\",\"message\":\"Failed to create OTA task\"}", 0, 1, 0);
+                        }
+                    }
+                }
+            }
+        } else if (strcmp(command->valuestring, "restart") == 0) {
+            esp_restart();
+        } else if (strcmp(command->valuestring, "set-coeff") == 0) {
+            cJSON *value_f = cJSON_GetObjectItemCaseSensitive(json, "value");
+            cJSON *name_f = cJSON_GetObjectItemCaseSensitive(json, "name");
+            cJSON *type_f = cJSON_GetObjectItemCaseSensitive(json, "type");
+            char response[128];
+
+            if (cJSON_IsString(name_f) && (name_f->valuestring != NULL) && cJSON_IsString(type_f) && (type_f->valuestring != NULL)) {
+                char *name = strdup(name_f->valuestring);
+                char *type = strdup(type_f->valuestring);
+
+                if (strcmp(type, "float") == 0 && cJSON_IsNumber(value_f)) {
+                    float value = value_f->valuedouble;
+                    set_setting(name, cJSON_CreateNumber(value));
+                    ESP_LOGI(TAG, "Set %s to %f", name, value);
+                    snprintf(response, sizeof(response), "{\"msg\":\"Set %s to %f\"}", name, value);
+                }
+                else if (cJSON_IsString(value_f) && (value_f->valuestring != NULL) && strcmp(type, "string") == 0) {
+                    char *value = value_f->valuestring;
+                    set_setting(name, cJSON_CreateString(value));
+                    ESP_LOGI(TAG, "Set %s to %s", name, value);
+                    snprintf(response, sizeof(response), "{\"msg\":\"Set %s to %s\"}", name, value);
+                }
+                else if (cJSON_IsNumber(value_f) && strcmp(type, "int") == 0) {
+                    int value = value_f->valueint;
+                    set_setting(name, cJSON_CreateNumber(value));
+                    ESP_LOGI(TAG, "Set %s to %d", name, value);
+                    snprintf(response, sizeof(response), "{\"msg\":\"Set %s to %d\"}", name, value);
+                } else {
+                    ESP_LOGE(TAG, "Invalid value type");
+                    snprintf(response, sizeof(response), "{\"msg\":\"Invalid value type\"}");
+                }
+
+                free(name);
+                free(type);
+            } else {
+                snprintf(response, sizeof(response), "{\"msg\":\"error\"}");
+            }
+            esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
+        } else if (strcmp(command->valuestring, "get-coeff") == 0) {
+            cJSON *type_f = cJSON_GetObjectItemCaseSensitive(json, "type");
+            cJSON *name_f = cJSON_GetObjectItemCaseSensitive(json, "name");
+            char response[128];
+            if (cJSON_IsString(name_f) && (name_f->valuestring != NULL) && cJSON_IsString(type_f) && (type_f->valuestring != NULL)) {
+                char *name = strdup(name_f->valuestring);
+                char *type = strdup(type_f->valuestring);
+                if (strcmp(type, "float") == 0) {
+                    float value = get_float_setting(name, -1.0f);
+                    ESP_LOGI(TAG, "Value of %s: %f\n", name, value);
+                    snprintf(response, sizeof(response), "{\"msg\":\"Value of %s: %f\"}", name, value);
+                }
+                else if (strcmp(type, "string") == 0) {
+                    char value[MAX_STR_LEN];
+                    if (get_string_setting(name, value, sizeof(value)) == ESP_OK) {
+                        ESP_LOGI(TAG, "Value of %s: %s\n", name, value);
+                        snprintf(response, sizeof(response), "{\"msg\":\"Value of %s: %s\"}", name, value);
+                    } else {
+                        ESP_LOGE(TAG, "Failed to get string setting %s", name);
+                        snprintf(response, sizeof(response), "{\"msg\":\"Failed to get string setting %s\"}", name);
+                    }
+                }
+                else if (strcmp(type, "int") == 0) {
+                    int value = get_int_setting(name, -1);
+                    ESP_LOGI(TAG, "Value of %s: %d\n", name, value);
+                    snprintf(response, sizeof(response), "{\"msg\":\"Value of %s: %d\"}", name, value);
+                } else {
+                    snprintf(response, sizeof(response), "{\"msg\":\"Invalid value type\"}");
+                }
+                free(name);
+                free(type);
+            } else {
+                snprintf(response, sizeof(response), "{\"msg\":\"error\"}");
+            }
+            esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
+        }
+        else if (strcmp(command->valuestring, "test-movement") == 0) {
+            char *code = strdup("from test_robot_lib import test\ntest()");
+            if (code != NULL) {
+                if (xQueueSend(python_code_queue, &code, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                    ESP_LOGE(TAG, "Failed to send Python code to queue");
+                    free(code);
+                } else {
+                    ESP_LOGI(TAG, "Python code sent to execution queue: %s", code);
+                }
+            }
+        }
+        else if (strcmp(command->valuestring, "test-line-sensor") == 0) {
+            char *code = strdup("from test_octoliner import test\ntest()");
+            if (code != NULL) {
+                if (xQueueSend(python_code_queue, &code, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                    ESP_LOGE(TAG, "Failed to send Python code to queue");
+                    free(code);
+                } else {
+                    ESP_LOGI(TAG, "Python code sent to execution queue: %s", code);
+                }
+            }
+        }
+        else if (strcmp(command->valuestring, "test-color-sensor") == 0) {
+            char *code = strdup("from test_tcs import test\ntest()");
+            if (code != NULL) {
+                if (xQueueSend(python_code_queue, &code, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                    ESP_LOGE(TAG, "Failed to send Python code to queue");
+                    free(code);
+                } else {
+                    ESP_LOGI(TAG, "Python code sent to execution queue: %s", code);
+                }
+            }
+        }
+        else if (strcmp(command->valuestring, "test-scan-i2c") == 0) {
+            char *code = strdup("from scan import scan\nscan()");
+            if (code != NULL) {
+                if (xQueueSend(python_code_queue, &code, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                    ESP_LOGE(TAG, "Failed to send Python code to queue");
+                    free(code);
+                } else {
+                    ESP_LOGI(TAG, "Python code sent to execution queue: %s", code);
+                }
+            }
+        }
+        else if (strcmp(command->valuestring, "battery-status") == 0) {
+            set_measure_adc_flag(true);
+        }
+        else if (strcmp(command->valuestring, "mark-valid") == 0) {
+            esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+            if (err == ESP_OK) {
+                esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC,
+                                       "{\"status\":\"success\",\"message\":\"Firmware marked as valid\"}", 0, 1, 0);
+                ESP_LOGI(TAG, "Firmware marked as valid");
+            } else {
+                char error_msg[128];
+                snprintf(error_msg, sizeof(error_msg),
+                        "{\"status\":\"error\",\"message\":\"Failed to mark valid: %s\"}",
+                        esp_err_to_name(err));
+                esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, error_msg, 0, 1, 0);
+                ESP_LOGE(TAG, "Failed to mark firmware as valid: %s", esp_err_to_name(err));
+            }
+        }
+    }
+
+    cJSON_Delete(json);
+}
+
+static void process_incoming_mqtt_message(esp_mqtt_client_handle_t client, const char *topic, int topic_len, const char *data, int data_len) {
+    if (!topic || topic_len <= 0) {
+        ESP_LOGW(TAG, "Received MQTT data without topic");
+        return;
+    }
+    if (!data || data_len <= 0) {
+        ESP_LOGW(TAG, "Received MQTT data without payload");
+        return;
+    }
+
+    printf("TOPIC=%.*s\r\n", topic_len, topic);
+    printf("DATA=%.*s\r\n", data_len, data);
+
+    if (topic_matches(topic, topic_len, MQTT_SYSTEM_INPUT_TOPIC)) {
+        process_system_input_message(client, data, data_len);
+    }
+}
+
+
 char* escape_json_string(const char* input) {
     if (!input) return NULL;
     
@@ -416,6 +765,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+        reset_all_partial_messages();
         break;
 
     case MQTT_EVENT_SUBSCRIBED:
@@ -430,231 +780,89 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
         break;
         
-    case MQTT_EVENT_DATA:
+    case MQTT_EVENT_DATA: {
         ESP_LOGI(TAG, "MQTT_EVENT_DATA");
-        printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
-        printf("DATA=%.*s\r\n", event->data_len, event->data);
-        
-        // Process JSON commands
-        if (strncmp(event->topic, MQTT_SYSTEM_INPUT_TOPIC, event->topic_len) == 0) {
-            cJSON *json = cJSON_ParseWithLength(event->data, event->data_len);
-            if (json == NULL) {
-                const char *error_ptr = cJSON_GetErrorPtr();
-                if (error_ptr != NULL) {
-                    ESP_LOGE(TAG, "JSON parse error before: %s", error_ptr);
+
+        partial_message_t *partial = find_partial_message(event->msg_id, event->topic, event->topic_len);
+        const char *topic_ptr = event->topic;
+        int topic_len = event->topic_len;
+        const char *data_ptr = event->data;
+        int data_len = event->data_len;
+        bool should_process = true;
+        partial_message_t *partial_to_release = NULL;
+        bool is_multipart = event->total_data_len > event->data_len;
+
+        if (is_multipart) {
+            should_process = false;
+            if (!partial && event->current_data_offset == 0) {
+                partial = start_partial_message(event->msg_id, event->topic, event->topic_len, event->total_data_len);
+                if (!partial) {
+                    ESP_LOGE(TAG, "Failed to start multipart MQTT message (msg_id=%d)", event->msg_id);
+                    goto mqtt_event_data_end;
                 }
-                break;
+                ESP_LOGI(TAG, "Receiving multipart MQTT message (msg_id=%d, total=%d)", event->msg_id, event->total_data_len);
+            } else if (!partial) {
+                ESP_LOGW(TAG, "Received MQTT multipart fragment without context (msg_id=%d, offset=%d)", event->msg_id, event->current_data_offset);
+                goto mqtt_event_data_end;
             }
-            
-            // Handle ping command
-            cJSON *command = cJSON_GetObjectItemCaseSensitive(json, "command");
-            if (cJSON_IsString(command) && (command->valuestring != NULL)) {
-                if (strcmp(command->valuestring, "ping") == 0) {
-                    // Send pong response
-                    char response[64];
-                    snprintf(response, sizeof(response), "{\"msg\":\"pong\"}");
-                    esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
-                    ESP_LOGI(TAG, "Responded to ping command");
+
+            if (!partial->topic && event->topic && event->topic_len > 0) {
+                char *topic_copy = malloc(event->topic_len + 1);
+                if (!topic_copy) {
+                    ESP_LOGE(TAG, "Failed to copy topic for multipart MQTT message");
+                } else {
+                    memcpy(topic_copy, event->topic, event->topic_len);
+                    topic_copy[event->topic_len] = '\0';
+                    partial->topic = topic_copy;
+                    partial->topic_len = event->topic_len;
                 }
-                else if (strcmp(command->valuestring, "py") == 0) {
-                    // Handle Python code
-                    cJSON *value = cJSON_GetObjectItemCaseSensitive(json, "value");
-                    if (cJSON_IsString(value) && (value->valuestring != NULL)) {
-                        char *code_copy = strdup(value->valuestring);
-                        if (code_copy != NULL) {
-                            if (xQueueSend(python_code_queue, &code_copy, pdMS_TO_TICKS(1000)) != pdTRUE) {
-                                ESP_LOGE(TAG, "Failed to send Python code to queue");
-                                free(code_copy);
-                            } else {
-                                ESP_LOGI(TAG, "Python code sent to execution queue: %s", code_copy);
-                            }
-                        }
-                    }
-                }                    
-                else if (strcmp(command->valuestring, "ota-update") == 0) {
-                    if (ota_in_progress) {
-                        esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, 
-                                               "{\"status\":\"error\",\"message\":\"OTA already in progress\"}", 0, 1, 0);
-                        ESP_LOGE(TAG, "OTA update already in progress");
-                    } else {
-                        // Handle OTA update
-                        cJSON *url = cJSON_GetObjectItemCaseSensitive(json, "url");
-                        if (cJSON_IsString(url) && (url->valuestring != NULL)) {
-                            char *url_copy = strdup(url->valuestring);
-                            if (url_copy != NULL) {
-                                // Start OTA in a separate task
-                                BaseType_t result = xTaskCreate(
-                                    ota_task,
-                                    "ota_task",
-                                    16384,  // Increased stack size
-                                    url_copy,
-                                    5,
-                                    NULL
-                                );
-                                if (result == pdPASS) {
-                                    ESP_LOGI(TAG, "OTA update task created for URL: %s", url_copy);
-                                } else {
-                                    ESP_LOGE(TAG, "Failed to create OTA task");
-                                    free(url_copy);
-                                    esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, 
-                                                           "{\"status\":\"error\",\"message\":\"Failed to create OTA task\"}", 0, 1, 0);
-                                }
-                            }
-                        }
-                    }
-                }
-                else if (strcmp(command->valuestring, "restart") == 0) {
-                    // Reset ESP32
-                    esp_restart();
-                }
-                else if (strcmp(command->valuestring, "set-coeff") == 0) {
-                    cJSON *value_f = cJSON_GetObjectItemCaseSensitive(json, "value");
-                    cJSON *name_f = cJSON_GetObjectItemCaseSensitive(json, "name");
-                    cJSON *type_f = cJSON_GetObjectItemCaseSensitive(json, "type");
-                    char response[128];
-                    
-                    
-                    if (cJSON_IsString(name_f) && (name_f->valuestring != NULL) && cJSON_IsString(type_f) && (type_f->valuestring != NULL)) {
-                        char *name = strdup(name_f->valuestring);
-                        char *type = strdup(type_f->valuestring);
-                        
-                        if (strcmp(type, "float") == 0 && cJSON_IsNumber(value_f)) {
-                            float value = value_f->valuedouble;
-                            set_setting(name, cJSON_CreateNumber(value));
-                            ESP_LOGI(TAG, "Set %s to %f",name, value);
-                            snprintf(response, sizeof(response), "{\"msg\":\"Set %s to %f\"}", name, value);
-                        }
-                        else if (cJSON_IsString(value_f) && (value_f->valuestring != NULL) && strcmp(type, "string") == 0) {
-                            char *value = value_f->valuestring;
-                            set_setting(name, cJSON_CreateString(value));
-                            ESP_LOGI(TAG, "Set %s to %s", name, value);
-                            snprintf(response, sizeof(response), "{\"msg\":\"Set %s to %s\"}", name, value);
-                        } 
-                        else if (cJSON_IsNumber(value_f) && strcmp(type, "int") == 0) {
-                            int value = value_f->valueint;
-                            set_setting(name, cJSON_CreateNumber(value));
-                            ESP_LOGI(TAG, "Set %s to %d", name, value);
-                            snprintf(response, sizeof(response), "{\"msg\":\"Set %s to %d\"}", name, value);
-                        }else{
-                            ESP_LOGE(TAG, "Invalid value type");
-                            snprintf(response, sizeof(response), "{\"msg\":\"Invalid value type\"}");
-                        }
-                        
-                        free(name);
-                        free(type);
-                    } else {
-                        snprintf(response, sizeof(response), "{\"msg\":\"error\"}");
-                    }
-                    esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
-                }
-                else if (strcmp(command->valuestring, "get-coeff") == 0) {
-                    cJSON *type_f = cJSON_GetObjectItemCaseSensitive(json, "type");
-                    cJSON *name_f = cJSON_GetObjectItemCaseSensitive(json, "name");
-                    char response[128];
-                    if (cJSON_IsString(name_f) && (name_f->valuestring != NULL) && cJSON_IsString(type_f) && (type_f->valuestring != NULL)) {
-                        char *name = strdup(name_f->valuestring);
-                        char *type = strdup(type_f->valuestring);
-                        if (strcmp(type, "float") == 0) {
-                            float value = get_float_setting(name, -1.0f);
-                            ESP_LOGI(TAG, "Value of %s: %f\n", name, value);
-                            snprintf(response, sizeof(response), "{\"msg\":\"Value of %s: %f\"}", name, value);
-                        }
-                        else if (strcmp(type, "string") == 0) {
-                            char value[MAX_STR_LEN];
-                            if (get_string_setting(name, value, sizeof(value)) == ESP_OK) {
-                                ESP_LOGI(TAG, "Value of %s: %s\n", name, value);
-                                snprintf(response, sizeof(response), "{\"msg\":\"Value of %s: %s\"}", name, value);
-                            } else {
-                                ESP_LOGE(TAG, "Failed to get string setting %s", name);
-                                snprintf(response, sizeof(response), "{\"msg\":\"Failed to get string setting %s\"}", name);
-                            }
-                        } 
-                        else if (strcmp(type, "int") == 0) {
-                            int value = get_int_setting(name, -1);
-                            ESP_LOGI(TAG, "Value of %s: %d\n", name, value);
-                            snprintf(response, sizeof(response), "{\"msg\":\"Value of %s: %d\"}", name, value);
-                        } else {
-                            snprintf(response, sizeof(response), "{\"msg\":\"Invalid value type\"}");
-                        }
-                        free(name);
-                        free(type);
-                    } else {
-                        snprintf(response, sizeof(response), "{\"msg\":\"error\"}");
-                    }
-                    esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
-                }
-                else if (strcmp(command->valuestring, "test-movement") == 0) {
-                    char *code = strdup("from test_robot_lib import test\ntest()");
-                    if (code != NULL) {
-                        if (xQueueSend(python_code_queue, &code, pdMS_TO_TICKS(1000)) != pdTRUE) {
-                            ESP_LOGE(TAG, "Failed to send Python code to queue");
-                            free(code);
-                        } else {
-                            ESP_LOGI(TAG, "Python code sent to execution queue: %s", code);
-                        }
-                    }
-                }
-                else if (strcmp(command->valuestring, "test-line-sensor") == 0) {
-                    char *code = strdup("from test_octoliner import test\ntest()");
-                    if (code != NULL) {
-                        if (xQueueSend(python_code_queue, &code, pdMS_TO_TICKS(1000)) != pdTRUE) {
-                            ESP_LOGE(TAG, "Failed to send Python code to queue");
-                            free(code);
-                        } else {
-                            ESP_LOGI(TAG, "Python code sent to execution queue: %s", code);
-                        }
-                    }
-                }
-                else if (strcmp(command->valuestring, "test-color-sensor") == 0) {
-                    char *code = strdup("from test_tcs import test\ntest()");
-                    if (code != NULL) {
-                        if (xQueueSend(python_code_queue, &code, pdMS_TO_TICKS(1000)) != pdTRUE) {
-                            ESP_LOGE(TAG, "Failed to send Python code to queue");
-                            free(code);
-                        } else {
-                            ESP_LOGI(TAG, "Python code sent to execution queue: %s", code);
-                        }
-                    }
-                }
-                else if (strcmp(command->valuestring, "test-scan-i2c") == 0) {
-                    char *code = strdup("from scan import scan\nscan()");
-                    if (code != NULL) {
-                        if (xQueueSend(python_code_queue, &code, pdMS_TO_TICKS(1000)) != pdTRUE) {
-                            ESP_LOGE(TAG, "Failed to send Python code to queue");
-                            free(code);
-                        } else {
-                            ESP_LOGI(TAG, "Python code sent to execution queue: %s", code);
-                        }
-                    }
-                }
-                else if (strcmp(command->valuestring, "battery-status") == 0) {
-                    set_measure_adc_flag(true);
-                }
-                else if (strcmp(command->valuestring, "mark-valid") == 0) {
-                    // Mark current firmware as valid
-                    esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
-                    if (err == ESP_OK) {
-                        esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, 
-                                               "{\"status\":\"success\",\"message\":\"Firmware marked as valid\"}", 0, 1, 0);
-                        ESP_LOGI(TAG, "Firmware marked as valid");
-                    } else {
-                        char error_msg[128];
-                        snprintf(error_msg, sizeof(error_msg), 
-                                "{\"status\":\"error\",\"message\":\"Failed to mark valid: %s\"}", 
-                                esp_err_to_name(err));
-                        esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, error_msg, 0, 1, 0);
-                        ESP_LOGE(TAG, "Failed to mark firmware as valid: %s", esp_err_to_name(err));
-                    }
-                }
-                
             }
-            
-            cJSON_Delete(json);
+
+            size_t offset = event->current_data_offset;
+            size_t chunk_len = event->data_len;
+            if (offset + chunk_len > partial->total_len) {
+                ESP_LOGE(TAG, "MQTT multipart fragment exceeds buffer (offset=%d len=%d total=%zu)", event->current_data_offset, event->data_len, partial->total_len);
+                complete_partial_message(partial);
+                goto mqtt_event_data_end;
+            }
+
+            memcpy(partial->buffer + offset, event->data, chunk_len);
+            size_t new_received = offset + chunk_len;
+            if (new_received > partial->received_len) {
+                partial->received_len = new_received;
+            }
+
+            if (partial->received_len >= partial->total_len) {
+                partial->buffer[partial->total_len] = '\0';
+                topic_ptr = partial->topic;
+                topic_len = (int)partial->topic_len;
+                data_ptr = partial->buffer;
+                data_len = partial->total_len;
+                partial_to_release = partial;
+                should_process = true;
+                ESP_LOGI(TAG, "Completed multipart MQTT message (msg_id=%d, total=%zu)", partial->msg_id, partial->total_len);
+            } else {
+                goto mqtt_event_data_end;
+            }
+        }
+
+        if (should_process) {
+            if (!topic_ptr && partial && partial->topic) {
+                topic_ptr = partial->topic;
+                topic_len = (int)partial->topic_len;
+            }
+            process_incoming_mqtt_message(client, topic_ptr, topic_len, data_ptr, data_len);
+        }
+
+    mqtt_event_data_end:
+        if (partial_to_release) {
+            complete_partial_message(partial_to_release);
         }
         break;
-        
+    }
     case MQTT_EVENT_ERROR:
         ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
+        reset_all_partial_messages();
         break;
         
     default:
