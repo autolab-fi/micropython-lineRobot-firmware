@@ -156,6 +156,8 @@ finally:
 
 `Robot.shutdown()` is also invoked automatically when the object is garbage-collected, but using one of the patterns above ensures the stop happens immediately when your check finishes.
 
+Shutdown now also detaches encoder IRQ handlers and deinitializes PWM channels, so no residual PWM is fed to the motor driver after verification ends even if the object is destroyed without an explicit `stop()` call.
+
 ### Timed Movement
 ```python
 # Move forward for 2 seconds

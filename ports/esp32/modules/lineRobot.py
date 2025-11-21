@@ -216,6 +216,29 @@ class Robot:
             print("Robot stopped")
         time.sleep_ms(30)
 
+    def _disable_encoder_irqs(self):
+        """Detach encoder IRQ handlers to avoid callbacks after shutdown."""
+        try:
+            self.encoder_pin_a_left.irq(handler=None)
+            self.encoder_pin_b_left.irq(handler=None)
+            self.encoder_pin_a_right.irq(handler=None)
+            self.encoder_pin_b_right.irq(handler=None)
+        except Exception:
+            # On some ports irq(None) may raise during interpreter shutdown
+            pass
+
+    def _deinit_pwm_channels(self):
+        """Turn off PWM outputs and release hardware resources."""
+        for channel in (self.in1, self.in2, self.in3, self.in4):
+            try:
+                channel.duty(0)
+            except Exception:
+                pass
+            try:
+                channel.deinit()
+            except Exception:
+                pass
+
     
     def encoder_degrees_left(self):
         """Get left encoder position in degrees"""
@@ -359,7 +382,12 @@ class Robot:
 
     def shutdown(self):
         """Stop actuators and switch off any status LED."""
+        # Block new movement requests and stop PID loops
+        self.block = True
         self.stop()
+        # Fully release hardware so PWM drive is not resumed later
+        self._disable_encoder_irqs()
+        self._deinit_pwm_channels()
         self.led_off()
 
     def __del__(self):
