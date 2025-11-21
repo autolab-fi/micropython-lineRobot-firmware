@@ -21,6 +21,7 @@
 #include "esp_wifi.h"
 #include "mqtt_client.h"
 #include "driver/uart.h"
+#include "modmachine.h"
 #include "cJSON.h"
 
 // WiFi configuration
@@ -183,6 +184,11 @@ static bool topic_matches(const char *topic, int topic_len, const char *expected
     return strncmp(topic, expected, expected_len) == 0;
 }
 
+static void stop_motors_for_reset(void) {
+    // Ensure all PWM outputs are silenced before performing a restart/reset.
+    machine_pwm_deinit_all();
+}
+
 static void process_system_input_message(esp_mqtt_client_handle_t client, const char *data, int data_len) {
     if (!data || data_len <= 0) {
         ESP_LOGW(TAG, "Empty MQTT payload on system input topic");
@@ -247,7 +253,8 @@ static void process_system_input_message(esp_mqtt_client_handle_t client, const 
                     }
                 }
             }
-        } else if (strcmp(command->valuestring, "restart") == 0) {
+        } else if (strcmp(command->valuestring, "restart") == 0 || strcmp(command->valuestring, "reset") == 0) {
+            stop_motors_for_reset();
             esp_restart();
         } else if (strcmp(command->valuestring, "set-coeff") == 0) {
             cJSON *value_f = cJSON_GetObjectItemCaseSensitive(json, "value");
