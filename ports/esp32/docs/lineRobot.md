@@ -210,6 +210,8 @@ right_speed = robot.get_speed_r()
 - `reset_regulators()` - Reset PID controller states
 - `constrain(value, min_val, max_val)` - Constrain value within range
 - `set_block_true()` - Enable blocking mode
+- `led_on()` / `led_off()` - Control optional status LED (set `led_pin` when creating `Robot`)
+- `shutdown()` - Stops motors and turns off the status LED; also used automatically with context manager support
 
 ## Examples
 
@@ -268,7 +270,22 @@ time.sleep(3)
 robot.stop()
 ```
 
-### Example 5: Encoder Monitoring
+### Example 5: Guaranteed shutdown after a time-limited check
+Если проверка вашего кода прерывается по таймауту, заверните действия с роботом
+в контекстный менеджер. Он гарантирует остановку моторов и отключение светодиодов
+(`led_pin`), даже если работа оборвётся исключением:
+
+```python
+from machine import Pin
+from lineRobot import Robot
+
+with Robot(led_pin=2) as robot:  # встроенный светодиод ESP32
+    robot.led_on()
+    robot.move_forward_seconds(5)
+    # Любое исключение или выход из блока вызывает robot.shutdown()
+```
+
+### Example 6: Encoder Monitoring
 ```python
 from lineRobot import Robot
 import time
@@ -288,7 +305,7 @@ for i in range(10):
 robot.stop()
 ```
 
-### Example 6: Configuration Override
+### Example 7: Configuration Override
 ```python
 from lineRobot import Robot
 

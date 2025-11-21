@@ -53,7 +53,8 @@ class Robot:
             "kis": 0.0,
             "ks": 80.0,
             "maxs": 15.0,
-            "debug": 0
+            "debug": 0,
+            "led_pin": None
         }
         try:
             #print("loading params from the memory")
@@ -97,7 +98,13 @@ class Robot:
         self.in2.duty(0)
         self.in3.duty(0)
         self.in4.duty(0)
-        
+
+        # Optional status LED
+        led_pin = config.get("led_pin")
+        self.led = Pin(led_pin, Pin.OUT) if led_pin is not None else None
+        if self.led:
+            self.led.value(0)
+
         # Encoder pins
         self.encoder_pin_a_left = Pin(config["pel1"], Pin.IN)
         self.encoder_pin_b_left = Pin(config["pel2"], Pin.IN)
@@ -339,6 +346,28 @@ class Robot:
         
         self.run_motor_left(self.left_motor_signal)
         self.run_motor_right(self.right_motor_signal)
+
+    def led_on(self):
+        """Turn the optional status LED on."""
+        if self.led:
+            self.led.value(1)
+
+    def led_off(self):
+        """Turn the optional status LED off."""
+        if self.led:
+            self.led.value(0)
+
+    def shutdown(self):
+        """Stop actuators and switch off any status LED."""
+        self.stop()
+        self.led_off()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.shutdown()
+        return False
     
     def reset_regulators(self):
         """Reset PID controllers"""
