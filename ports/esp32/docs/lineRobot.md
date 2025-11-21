@@ -131,6 +131,31 @@ robot.turn_left()
 robot.turn_right_angle(45)
 ```
 
+### Guaranteed Stop at End of Script
+Wrap long checks in a `with` block or `try/finally` so motors stop and any status LED turns off even if the loop ends early:
+
+```python
+from lineRobot import Robot
+
+with Robot() as robot:
+    for _ in range(10):
+        robot.turn_left_angle(45)
+        robot.move_forward_distance(25)
+        robot.turn_right()
+        robot.move_forward_distance(25)
+        robot.turn_right()
+        robot.move_forward_distance(25)
+
+# Equivalent without context manager
+robot = Robot()
+try:
+    robot.move_forward_distance(25)
+finally:
+    robot.shutdown()
+```
+
+`Robot.shutdown()` is also invoked automatically when the object is garbage-collected, but using one of the patterns above ensures the stop happens immediately when your check finishes.
+
 ### Timed Movement
 ```python
 # Move forward for 2 seconds

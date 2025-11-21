@@ -362,6 +362,13 @@ class Robot:
         self.stop()
         self.led_off()
 
+    def __del__(self):
+        try:
+            self.shutdown()
+        except Exception:
+            # Avoid raising during interpreter shutdown
+            pass
+
     def __enter__(self):
         return self
 
