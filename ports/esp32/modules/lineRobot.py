@@ -68,6 +68,8 @@ class Robot:
             return default_config
     
     def _init_params(self, config):
+        # Keep a copy of the current configuration for safe reinitialization
+        self._config = config.copy()
         # Physical parameters
         self.RADIUS_WHEEL = config["wrad"]
         self.distance_between_wheel_and_center = config["wdist"] / 2
@@ -127,9 +129,10 @@ class Robot:
         
         # PID state variables
         self.reset_regulators()
-        
+
         # Block flag
         self.block = False
+        self._shut_down = False
         
     def begin(self):
         """Initialize encoder interrupts"""
@@ -382,6 +385,12 @@ class Robot:
 
     def shutdown(self):
         """Stop actuators and switch off any status LED."""
+        if self._shut_down:
+            # Already released; ensure we keep movements blocked and LED off
+            self.block = True
+            self.led_off()
+            return
+
         # Block new movement requests and stop PID loops
         self.block = True
         self.stop()
@@ -389,6 +398,7 @@ class Robot:
         self._disable_encoder_irqs()
         self._deinit_pwm_channels()
         self.led_off()
+        self._shut_down = True
 
     def __del__(self):
         try:
@@ -403,6 +413,21 @@ class Robot:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown()
         return False
+
+    def _restart_hardware_after_shutdown(self):
+        """Reinitialize PWM/IRQ resources after a shutdown event."""
+        if not self._shut_down:
+            return
+
+        # Recreate PWM channels and encoder IRQs
+        self._init_hardware(self._config)
+        self._init_state()
+        self.begin()
+
+    def _ensure_ready_for_motion(self):
+        """Return False when motion should be skipped, otherwise ensure HW is ready."""
+        self._restart_hardware_after_shutdown()
+        return not self.block
     
     def reset_regulators(self):
         """Reset PID controllers"""
@@ -438,7 +463,7 @@ class Robot:
     
     def move_forward_speed_distance(self, sp, dist):
         """Move forward with specified speed for specified distance"""
-        if self.block:
+        if not self._ensure_ready_for_motion():
             return
             
         # Calculate target angle
@@ -509,7 +534,7 @@ class Robot:
     
     def move_backward_speed_distance(self, sp, dist):
         """Move backward with specified speed for specified distance"""
-        if self.block:
+        if not self._ensure_ready_for_motion():
             return
             
         self.reset_encoders()
@@ -576,7 +601,7 @@ class Robot:
     
     def move_forward_seconds(self, seconds):
         """Move forward for specified time"""
-        if self.block:
+        if not self._ensure_ready_for_motion():
             return
             
         self.reset_encoders()
@@ -614,7 +639,7 @@ class Robot:
     
     def move_backward_seconds(self, seconds):
         """Move backward for specified time"""
-        if self.block:
+        if not self._ensure_ready_for_motion():
             return
             
         self.reset_encoders()
@@ -652,7 +677,7 @@ class Robot:
     
     def turn_left_angle(self, angle):
         """Turn left by specified angle in degrees"""
-        if self.block:
+        if not self._ensure_ready_for_motion():
             return
             
         self.reset_encoders()
@@ -713,7 +738,7 @@ class Robot:
         
     def turn_right_angle(self, angle):
         """Turn right by specified angle in degrees"""
-        if self.block:
+        if not self._ensure_ready_for_motion():
             return
             
         self.reset_encoders()

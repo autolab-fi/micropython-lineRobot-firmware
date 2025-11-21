@@ -158,6 +158,8 @@ finally:
 
 Shutdown now also detaches encoder IRQ handlers and deinitializes PWM channels, so no residual PWM is fed to the motor driver after verification ends even if the object is destroyed without an explicit `stop()` call. Motion helpers (`move_*`, `turn_*`) themselves are wrapped in `try/finally` blocks and break out early if `shutdown()` sets the `block` flag, so an external timeout that raises (or calls `shutdown`) during a movement still results in a final `stop()` before control returns.
 
+If a timeout-triggered `shutdown()` fired during a previous check, the next motion command will reinitialize the PWM channels and encoder interrupts automatically before running, so the robot can move again instead of staying permanently blocked.
+
 ### Timed Movement
 ```python
 # Move forward for 2 seconds
