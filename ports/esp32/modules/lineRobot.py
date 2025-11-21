@@ -456,52 +456,56 @@ class Robot:
         self.previous_err_ang_left = self.target_angle
         self.previous_err_ang_right = self.target_angle
         c = 0
-        while ((abs(self.target_angle - angle_left) > 0.2 or 
-                abs(self.target_angle - angle_right) > 0.2) and 
-               time.ticks_diff(time.ticks_ms(), start_time) < period):
-            
-            angle_left = self.encoder_radian_left()
-            angle_right = self.encoder_radian_right()
-            if c % 10 == 0 and self.debug:
-                print(f"Target: {self.target_angle:.2f}, Left: {angle_left:.2f}, Right: {angle_right:.2f}, integralL: {self.integral_ang_left:.2f}, integralR: {self.integral_ang_right:.2f}, prevErrL: {self.previous_err_ang_left:.2f}, prevErrR: {self.previous_err_ang_right:.2f}")
-                c+=1
-            # PID control for both motors
-            left_motor_speed, self.integral_ang_left, self.previous_err_ang_left, self.last_time_left = \
-                self.compute_pid_angle_motor(self.target_angle - angle_left, self.kp_ang, 
-                                           self.kd_ang, self.ki_ang, self.integral_ang_left,
-                                           self.previous_err_ang_left, self.last_time_left)
-            
-            right_motor_speed, self.integral_ang_right, self.previous_err_ang_right, self.last_time_right = \
-                self.compute_pid_angle_motor(self.target_angle - angle_right, self.kp_ang, 
-                                           self.kd_ang, self.ki_ang, self.integral_ang_right,
-                                           self.previous_err_ang_right, self.last_time_right)
-            
-            # Apply speed scaling
-            left_motor_speed = self.constrain(int(left_motor_speed * k_sp), -75, 75)
-            right_motor_speed = self.constrain(int(right_motor_speed * k_sp), -75, 75)
-            
-            # Smooth start
-            elapsed = time.ticks_diff(time.ticks_ms(), start_time)
+        try:
+            while ((abs(self.target_angle - angle_left) > 0.2 or
+                    abs(self.target_angle - angle_right) > 0.2) and
+                   time.ticks_diff(time.ticks_ms(), start_time) < period):
 
-            if elapsed < 800:
-                power = self.constrain(0.5 + elapsed / 1000.0, 0.5, 1.0)
-                left_motor_speed = int(left_motor_speed * power)
-                right_motor_speed = int(right_motor_speed * power)
+                if self.block:
+                    break
 
-            if elapsed < 800:
-                power = self.constrain(0.5 + elapsed / 1000.0, 0.5, 1.0)
-                left_motor_speed = int(left_motor_speed * power)
-                right_motor_speed = int(right_motor_speed * power)
-            
-            # Straight line correction
-            if abs(self.previous_err_ang_left) < abs(self.previous_err_ang_right):
-                right_motor_speed += int((angle_left - angle_right) * self.k_straight)
-            elif abs(self.previous_err_ang_left) > abs(self.previous_err_ang_right):
-                left_motor_speed += int((angle_right - angle_left) * self.k_straight)
+                angle_left = self.encoder_radian_left()
+                angle_right = self.encoder_radian_right()
+                if c % 10 == 0 and self.debug:
+                    print(f"Target: {self.target_angle:.2f}, Left: {angle_left:.2f}, Right: {angle_right:.2f}, integralL: {self.integral_ang_left:.2f}, integralR: {self.integral_ang_right:.2f}, prevErrL: {self.previous_err_ang_left:.2f}, prevErrR: {self.previous_err_ang_right:.2f}")
+                    c+=1
+                # PID control for both motors
+                left_motor_speed, self.integral_ang_left, self.previous_err_ang_left, self.last_time_left = \
+                    self.compute_pid_angle_motor(self.target_angle - angle_left, self.kp_ang,
+                                               self.kd_ang, self.ki_ang, self.integral_ang_left,
+                                               self.previous_err_ang_left, self.last_time_left)
 
-            self.run_motors_speed(left_motor_speed, right_motor_speed)
-        
-        self.stop()
+                right_motor_speed, self.integral_ang_right, self.previous_err_ang_right, self.last_time_right = \
+                    self.compute_pid_angle_motor(self.target_angle - angle_right, self.kp_ang,
+                                               self.kd_ang, self.ki_ang, self.integral_ang_right,
+                                               self.previous_err_ang_right, self.last_time_right)
+
+                # Apply speed scaling
+                left_motor_speed = self.constrain(int(left_motor_speed * k_sp), -75, 75)
+                right_motor_speed = self.constrain(int(right_motor_speed * k_sp), -75, 75)
+
+                # Smooth start
+                elapsed = time.ticks_diff(time.ticks_ms(), start_time)
+
+                if elapsed < 800:
+                    power = self.constrain(0.5 + elapsed / 1000.0, 0.5, 1.0)
+                    left_motor_speed = int(left_motor_speed * power)
+                    right_motor_speed = int(right_motor_speed * power)
+
+                if elapsed < 800:
+                    power = self.constrain(0.5 + elapsed / 1000.0, 0.5, 1.0)
+                    left_motor_speed = int(left_motor_speed * power)
+                    right_motor_speed = int(right_motor_speed * power)
+
+                # Straight line correction
+                if abs(self.previous_err_ang_left) < abs(self.previous_err_ang_right):
+                    right_motor_speed += int((angle_left - angle_right) * self.k_straight)
+                elif abs(self.previous_err_ang_left) > abs(self.previous_err_ang_right):
+                    left_motor_speed += int((angle_right - angle_left) * self.k_straight)
+
+                self.run_motors_speed(left_motor_speed, right_motor_speed)
+        finally:
+            self.stop()
     
     def move_backward_speed_distance(self, sp, dist):
         """Move backward with specified speed for specified distance"""
@@ -521,41 +525,46 @@ class Robot:
         self.previous_err_ang_left = self.target_angle
         self.previous_err_ang_right = self.target_angle
         
-        while ((abs(angle_left - self.target_angle) > 0.2 or 
-                abs(angle_right - self.target_angle) > 0.2) and 
-               time.ticks_diff(time.ticks_ms(), start_time) < period):
-            
-            angle_left = abs(self.encoder_radian_left())
-            angle_right = abs(self.encoder_radian_right())
-            
-            left_motor_speed, self.integral_ang_left, self.previous_err_ang_left, self.last_time_left = \
-                self.compute_pid_angle_motor(self.target_angle - angle_left, self.kp_ang, 
-                                           self.kd_ang, self.ki_ang, self.integral_ang_left,
-                                           self.previous_err_ang_left, self.last_time_left)
-            
-            right_motor_speed, self.integral_ang_right, self.previous_err_ang_right, self.last_time_right = \
-                self.compute_pid_angle_motor(self.target_angle - angle_right, self.kp_ang, 
-                                           self.kd_ang, self.ki_ang, self.integral_ang_right,
-                                           self.previous_err_ang_right, self.last_time_right)
-            
-            left_motor_speed = self.constrain(left_motor_speed, -75, 75)
-            right_motor_speed = self.constrain(right_motor_speed, -75, 75)
-            
-            # Smooth start
-            elapsed = time.ticks_diff(time.ticks_ms(), start_time)
-            if elapsed < 500:
-                power = self.constrain(0.5 + elapsed / 1000.0, 0.5, 1.0)
-                left_motor_speed = int(left_motor_speed * power)
-                right_motor_speed = int(right_motor_speed * power)
-            
-            # Straight line correction
-            if abs(self.previous_err_ang_left) < abs(self.previous_err_ang_right):
-                right_motor_speed += int((angle_left - angle_right) * self.k_straight)
-            elif abs(self.previous_err_ang_left) > abs(self.previous_err_ang_right):
-                left_motor_speed += int((angle_right - angle_left) * self.k_straight)
-            
-            self.run_motors_speed(-left_motor_speed, -right_motor_speed)
-        self.stop()
+        try:
+            while ((abs(angle_left - self.target_angle) > 0.2 or
+                    abs(angle_right - self.target_angle) > 0.2) and
+                   time.ticks_diff(time.ticks_ms(), start_time) < period):
+
+                if self.block:
+                    break
+
+                angle_left = abs(self.encoder_radian_left())
+                angle_right = abs(self.encoder_radian_right())
+
+                left_motor_speed, self.integral_ang_left, self.previous_err_ang_left, self.last_time_left = \
+                    self.compute_pid_angle_motor(self.target_angle - angle_left, self.kp_ang,
+                                               self.kd_ang, self.ki_ang, self.integral_ang_left,
+                                               self.previous_err_ang_left, self.last_time_left)
+
+                right_motor_speed, self.integral_ang_right, self.previous_err_ang_right, self.last_time_right = \
+                    self.compute_pid_angle_motor(self.target_angle - angle_right, self.kp_ang,
+                                               self.kd_ang, self.ki_ang, self.integral_ang_right,
+                                               self.previous_err_ang_right, self.last_time_right)
+
+                left_motor_speed = self.constrain(left_motor_speed, -75, 75)
+                right_motor_speed = self.constrain(right_motor_speed, -75, 75)
+
+                # Smooth start
+                elapsed = time.ticks_diff(time.ticks_ms(), start_time)
+                if elapsed < 500:
+                    power = self.constrain(0.5 + elapsed / 1000.0, 0.5, 1.0)
+                    left_motor_speed = int(left_motor_speed * power)
+                    right_motor_speed = int(right_motor_speed * power)
+
+                # Straight line correction
+                if abs(self.previous_err_ang_left) < abs(self.previous_err_ang_right):
+                    right_motor_speed += int((angle_left - angle_right) * self.k_straight)
+                elif abs(self.previous_err_ang_left) > abs(self.previous_err_ang_right):
+                    left_motor_speed += int((angle_right - angle_left) * self.k_straight)
+
+                self.run_motors_speed(-left_motor_speed, -right_motor_speed)
+        finally:
+            self.stop()
     
     def move_forward_distance(self, dist):
         """Move forward for specified distance at standard speed"""
@@ -575,28 +584,33 @@ class Robot:
         start_time = time.ticks_ms()
         period = seconds * 1000
         
-        while time.ticks_diff(time.ticks_ms(), start_time) < period:
-            angle_left = self.encoder_radian_left()
-            angle_right = self.encoder_radian_right()
-            
-            left_motor_speed = self.STANDARD_SPEED_PERCENTAGE_SLOW
-            right_motor_speed = self.STANDARD_SPEED_PERCENTAGE_SLOW
-            
-            # Smooth start
-            elapsed = time.ticks_diff(time.ticks_ms(), start_time)
-            if elapsed < 500:
-                power = self.constrain(0.5 + elapsed / 1000.0, 0.5, 1.0)
-                left_motor_speed = int(left_motor_speed * power)
-                right_motor_speed = int(right_motor_speed * power)
-            
-            # Straight line correction
-            if angle_left > angle_right:
-                right_motor_speed += int((angle_left - angle_right) * self.k_straight)
-            elif angle_left < angle_right:
-                left_motor_speed += int((angle_right - angle_left) * self.k_straight)
-            
-            self.run_motors_speed(left_motor_speed, right_motor_speed)
-        self.stop()
+        try:
+            while time.ticks_diff(time.ticks_ms(), start_time) < period:
+                if self.block:
+                    break
+
+                angle_left = self.encoder_radian_left()
+                angle_right = self.encoder_radian_right()
+
+                left_motor_speed = self.STANDARD_SPEED_PERCENTAGE_SLOW
+                right_motor_speed = self.STANDARD_SPEED_PERCENTAGE_SLOW
+
+                # Smooth start
+                elapsed = time.ticks_diff(time.ticks_ms(), start_time)
+                if elapsed < 500:
+                    power = self.constrain(0.5 + elapsed / 1000.0, 0.5, 1.0)
+                    left_motor_speed = int(left_motor_speed * power)
+                    right_motor_speed = int(right_motor_speed * power)
+
+                # Straight line correction
+                if angle_left > angle_right:
+                    right_motor_speed += int((angle_left - angle_right) * self.k_straight)
+                elif angle_left < angle_right:
+                    left_motor_speed += int((angle_right - angle_left) * self.k_straight)
+
+                self.run_motors_speed(left_motor_speed, right_motor_speed)
+        finally:
+            self.stop()
     
     def move_backward_seconds(self, seconds):
         """Move backward for specified time"""
@@ -608,28 +622,33 @@ class Robot:
         start_time = time.ticks_ms()
         period = seconds * 1000
         
-        while time.ticks_diff(time.ticks_ms(), start_time) < period:
-            angle_left = self.encoder_radian_left()
-            angle_right = self.encoder_radian_right()
-            
-            left_motor_speed = self.STANDARD_SPEED_PERCENTAGE_SLOW
-            right_motor_speed = self.STANDARD_SPEED_PERCENTAGE_SLOW
-            
-            # Smooth start
-            elapsed = time.ticks_diff(time.ticks_ms(), start_time)
-            if elapsed < 500:
-                power = self.constrain(0.5 + elapsed / 1000.0, 0.5, 1.0)
-                left_motor_speed = int(left_motor_speed * power)
-                right_motor_speed = int(right_motor_speed * power)
-            
-            # Straight line correction
-            if abs(angle_left) > abs(angle_right):
-                right_motor_speed += int((angle_left - angle_right) * self.k_straight)
-            elif abs(angle_left) < abs(angle_right):
-                left_motor_speed += int((angle_right - angle_left) * self.k_straight)
-            
-            self.run_motors_speed(-left_motor_speed, -right_motor_speed)
-        self.stop()
+        try:
+            while time.ticks_diff(time.ticks_ms(), start_time) < period:
+                if self.block:
+                    break
+
+                angle_left = self.encoder_radian_left()
+                angle_right = self.encoder_radian_right()
+
+                left_motor_speed = self.STANDARD_SPEED_PERCENTAGE_SLOW
+                right_motor_speed = self.STANDARD_SPEED_PERCENTAGE_SLOW
+
+                # Smooth start
+                elapsed = time.ticks_diff(time.ticks_ms(), start_time)
+                if elapsed < 500:
+                    power = self.constrain(0.5 + elapsed / 1000.0, 0.5, 1.0)
+                    left_motor_speed = int(left_motor_speed * power)
+                    right_motor_speed = int(right_motor_speed * power)
+
+                # Straight line correction
+                if abs(angle_left) > abs(angle_right):
+                    right_motor_speed += int((angle_left - angle_right) * self.k_straight)
+                elif abs(angle_left) < abs(angle_right):
+                    left_motor_speed += int((angle_right - angle_left) * self.k_straight)
+
+                self.run_motors_speed(-left_motor_speed, -right_motor_speed)
+        finally:
+            self.stop()
     
     def turn_left_angle(self, angle):
         """Turn left by specified angle in degrees"""
@@ -648,44 +667,49 @@ class Robot:
         self.previous_err_ang_left = self.target_angle
         self.previous_err_ang_right = self.target_angle
         
-        while ((abs(self.previous_err_ang_left) > error or 
-                abs(self.previous_err_ang_right) > error) and 
-               time.ticks_diff(time.ticks_ms(), start_time) < period):
-            
-            angle_left = abs(self.encoder_radian_left())
-            angle_right = abs(self.encoder_radian_right())
-            
-            left_motor_speed, self.integral_ang_left, self.previous_err_ang_left, self.last_time_left = \
-                self.compute_pid_angle_motor(self.target_angle - angle_left, self.kp_ang, 
-                                           self.kd_ang, self.ki_ang, self.integral_ang_left,
-                                           self.previous_err_ang_left, self.last_time_left)
-            
-            right_motor_speed, self.integral_ang_right, self.previous_err_ang_right, self.last_time_right = \
-                self.compute_pid_angle_motor(self.target_angle - angle_right, self.kp_ang, 
-                                           self.kd_ang, self.ki_ang, self.integral_ang_right,
-                                           self.previous_err_ang_right, self.last_time_right)
-            
-            left_motor_speed = self.constrain(left_motor_speed, -75, 75)
-            right_motor_speed = self.constrain(right_motor_speed, -75, 75)
-            
-            # Smooth start
-            elapsed = time.ticks_diff(time.ticks_ms(), start_time)
-            if elapsed < 500:
-                power = self.constrain(0.5 + elapsed / 1000.0, 0.5, 1.0)
-                left_motor_speed = int(left_motor_speed * power)
-                right_motor_speed = int(right_motor_speed * power)
-            
-            # Synchronization correction
-            if abs(self.previous_err_ang_left) < abs(self.previous_err_ang_right):
-                right_motor_speed += int((angle_left - angle_right) * self.k_straight)
-            elif abs(self.previous_err_ang_left) > abs(self.previous_err_ang_right):
-                left_motor_speed += int((angle_right - angle_left) * self.k_straight)
-            
-            final_left = int(-left_motor_speed * self.STANDARD_SPEED_PERCENTAGE / 100.0)
-            final_right = int(right_motor_speed * self.STANDARD_SPEED_PERCENTAGE / 100.0)
-            self.run_motors_speed(final_left, final_right)
-        self.stop()
-        time.sleep_ms(500)
+        try:
+            while ((abs(self.previous_err_ang_left) > error or
+                    abs(self.previous_err_ang_right) > error) and
+                   time.ticks_diff(time.ticks_ms(), start_time) < period):
+
+                if self.block:
+                    break
+
+                angle_left = abs(self.encoder_radian_left())
+                angle_right = abs(self.encoder_radian_right())
+
+                left_motor_speed, self.integral_ang_left, self.previous_err_ang_left, self.last_time_left = \
+                    self.compute_pid_angle_motor(self.target_angle - angle_left, self.kp_ang,
+                                               self.kd_ang, self.ki_ang, self.integral_ang_left,
+                                               self.previous_err_ang_left, self.last_time_left)
+
+                right_motor_speed, self.integral_ang_right, self.previous_err_ang_right, self.last_time_right = \
+                    self.compute_pid_angle_motor(self.target_angle - angle_right, self.kp_ang,
+                                               self.kd_ang, self.ki_ang, self.integral_ang_right,
+                                               self.previous_err_ang_right, self.last_time_right)
+
+                left_motor_speed = self.constrain(left_motor_speed, -75, 75)
+                right_motor_speed = self.constrain(right_motor_speed, -75, 75)
+
+                # Smooth start
+                elapsed = time.ticks_diff(time.ticks_ms(), start_time)
+                if elapsed < 500:
+                    power = self.constrain(0.5 + elapsed / 1000.0, 0.5, 1.0)
+                    left_motor_speed = int(left_motor_speed * power)
+                    right_motor_speed = int(right_motor_speed * power)
+
+                # Synchronization correction
+                if abs(self.previous_err_ang_left) < abs(self.previous_err_ang_right):
+                    right_motor_speed += int((angle_left - angle_right) * self.k_straight)
+                elif abs(self.previous_err_ang_left) > abs(self.previous_err_ang_right):
+                    left_motor_speed += int((angle_right - angle_left) * self.k_straight)
+
+                final_left = int(-left_motor_speed * self.STANDARD_SPEED_PERCENTAGE / 100.0)
+                final_right = int(right_motor_speed * self.STANDARD_SPEED_PERCENTAGE / 100.0)
+                self.run_motors_speed(final_left, final_right)
+        finally:
+            self.stop()
+            time.sleep_ms(500)
         
     def turn_right_angle(self, angle):
         """Turn right by specified angle in degrees"""
@@ -704,44 +728,49 @@ class Robot:
         self.previous_err_ang_left = self.target_angle
         self.previous_err_ang_right = self.target_angle
         
-        while ((abs(self.previous_err_ang_left) > error or 
-                abs(self.previous_err_ang_right) > error) and 
-               time.ticks_diff(time.ticks_ms(), start_time) < period):
-            
-            angle_left = abs(self.encoder_radian_left())
-            angle_right = abs(self.encoder_radian_right())
-            
-            left_motor_speed, self.integral_ang_left, self.previous_err_ang_left, self.last_time_left = \
-                self.compute_pid_angle_motor(self.target_angle - angle_left, self.kp_ang, 
-                                           self.kd_ang, self.ki_ang, self.integral_ang_left,
-                                           self.previous_err_ang_left, self.last_time_left)
-            
-            right_motor_speed, self.integral_ang_right, self.previous_err_ang_right, self.last_time_right = \
-                self.compute_pid_angle_motor(self.target_angle - angle_right, self.kp_ang, 
-                                           self.kd_ang, self.ki_ang, self.integral_ang_right,
-                                           self.previous_err_ang_right, self.last_time_right)
-            
-            left_motor_speed = self.constrain(left_motor_speed, -75, 75)
-            right_motor_speed = self.constrain(right_motor_speed, -75, 75)
-            
-            # Smooth start
-            elapsed = time.ticks_diff(time.ticks_ms(), start_time)
-            if elapsed < 500:
-                power = self.constrain(0.5 + elapsed / 1000.0, 0.5, 1.0)
-                left_motor_speed = int(left_motor_speed * power)
-                right_motor_speed = int(right_motor_speed * power)
-            
-            # Synchronization correction
-            if abs(self.previous_err_ang_left) < abs(self.previous_err_ang_right):
-                right_motor_speed += int((angle_left - angle_right) * self.k_straight)
-            elif abs(self.previous_err_ang_left) > abs(self.previous_err_ang_right):
-                left_motor_speed += int((angle_right - angle_left) * self.k_straight)
-            
-            final_left = int(left_motor_speed * self.STANDARD_SPEED_PERCENTAGE / 100.0)
-            final_right = int(-right_motor_speed * self.STANDARD_SPEED_PERCENTAGE / 100.0)
-            self.run_motors_speed(final_left, final_right)
-        self.stop()
-        time.sleep_ms(500)
+        try:
+            while ((abs(self.previous_err_ang_left) > error or
+                    abs(self.previous_err_ang_right) > error) and
+                   time.ticks_diff(time.ticks_ms(), start_time) < period):
+
+                if self.block:
+                    break
+
+                angle_left = abs(self.encoder_radian_left())
+                angle_right = abs(self.encoder_radian_right())
+
+                left_motor_speed, self.integral_ang_left, self.previous_err_ang_left, self.last_time_left = \
+                    self.compute_pid_angle_motor(self.target_angle - angle_left, self.kp_ang,
+                                               self.kd_ang, self.ki_ang, self.integral_ang_left,
+                                               self.previous_err_ang_left, self.last_time_left)
+
+                right_motor_speed, self.integral_ang_right, self.previous_err_ang_right, self.last_time_right = \
+                    self.compute_pid_angle_motor(self.target_angle - angle_right, self.kp_ang,
+                                               self.kd_ang, self.ki_ang, self.integral_ang_right,
+                                               self.previous_err_ang_right, self.last_time_right)
+
+                left_motor_speed = self.constrain(left_motor_speed, -75, 75)
+                right_motor_speed = self.constrain(right_motor_speed, -75, 75)
+
+                # Smooth start
+                elapsed = time.ticks_diff(time.ticks_ms(), start_time)
+                if elapsed < 500:
+                    power = self.constrain(0.5 + elapsed / 1000.0, 0.5, 1.0)
+                    left_motor_speed = int(left_motor_speed * power)
+                    right_motor_speed = int(right_motor_speed * power)
+
+                # Synchronization correction
+                if abs(self.previous_err_ang_left) < abs(self.previous_err_ang_right):
+                    right_motor_speed += int((angle_left - angle_right) * self.k_straight)
+                elif abs(self.previous_err_ang_left) > abs(self.previous_err_ang_right):
+                    left_motor_speed += int((angle_right - angle_left) * self.k_straight)
+
+                final_left = int(left_motor_speed * self.STANDARD_SPEED_PERCENTAGE / 100.0)
+                final_right = int(-right_motor_speed * self.STANDARD_SPEED_PERCENTAGE / 100.0)
+                self.run_motors_speed(final_left, final_right)
+        finally:
+            self.stop()
+            time.sleep_ms(500)
     
     def reset_left_encoder(self):
         """Reset left encoder position"""
