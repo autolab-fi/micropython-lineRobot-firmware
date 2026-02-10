@@ -34,6 +34,7 @@
 #define OFFLINE_RESTART_TIMEOUT_MS             (15 * 60 * 1000)
 #define RECOVERY_GUARD_COOLDOWN_MS             5000
 #define ENABLE_OFFLINE_FALLBACK_RESTART        1
+#define WIFI_INITIAL_CONNECT_WAIT_MS            15000
 
 // WiFi event bits
 #define WIFI_CONNECTED_BIT BIT0
@@ -1106,18 +1107,18 @@ static void wifi_init_sta()
 
     ESP_LOGI(TAG, "wifi_init_sta finished.");
 
-    // Wait for first connection signal once at startup.
+    // Wait only briefly for initial connection; recovery logic continues in mqtt_task.
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
                                            WIFI_CONNECTED_BIT,
                                            pdFALSE,
                                            pdFALSE,
-                                           portMAX_DELAY);
+                                           pdMS_TO_TICKS(WIFI_INITIAL_CONNECT_WAIT_MS));
 
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
                  wssid, wpass);
     } else {
-        ESP_LOGE(TAG, "UNEXPECTED EVENT");
+        ESP_LOGW(TAG, "Initial WiFi connect timed out after %d ms; continuing with recovery loop", WIFI_INITIAL_CONNECT_WAIT_MS);
     }
 }
 
