@@ -1266,8 +1266,8 @@ void mqtt_task(void *pvParameter) {
         }
 
 #if ENABLE_OFFLINE_FALLBACK_RESTART
-        if (!s_recovery.wifi_connected && !s_recovery.mqtt_connected && elapsed_ms_since(s_recovery.last_ip_tick) >= OFFLINE_RESTART_TIMEOUT_MS) {
-            ESP_LOGE(TAG, "Recovery L4 fallback: restart after %u ms offline", (unsigned)elapsed_ms_since(s_recovery.last_ip_tick));
+        if (!s_recovery.wifi_connected && !s_recovery.mqtt_connected && elapsed_ms_since(s_recovery.last_wifi_disconnect_tick) >= OFFLINE_RESTART_TIMEOUT_MS) {
+            ESP_LOGE(TAG, "Recovery L4 fallback: restart after %u ms offline", (unsigned)elapsed_ms_since(s_recovery.last_wifi_disconnect_tick));
             stop_motors_for_reset();
             esp_restart();
         }
