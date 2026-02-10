@@ -20,16 +20,27 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "mqtt_client.h"
+#include "lwip/netdb.h"
+#include "lwip/inet.h"
 #include "driver/uart.h"
 #include "modmachine.h"
 #include "cJSON.h"
 
-// WiFi configuration
-#define EXAMPLE_ESP_MAXIMUM_RETRY  5
+// Recovery configuration
+#define WIFI_RECONNECT_BACKOFF_STEPS           5
+#define WIFI_RECONNECT_BACKOFF_MAX_MS          30000
+#define WIFI_IP_RECOVERY_TIMEOUT_MS            (5 * 60 * 1000)
+#define MQTT_RECOVERY_TIMEOUT_MS               (3 * 60 * 1000)
+#define OFFLINE_RESTART_TIMEOUT_MS             (15 * 60 * 1000)
+#define RECOVERY_GUARD_COOLDOWN_MS             5000
+#define ENABLE_OFFLINE_FALLBACK_RESTART        1
+#define WIFI_INITIAL_CONNECT_WAIT_MS            15000
+#define FW_VERSION                              "21.10.2025"
+#define FW_BUILD_DATE                           __DATE__
+#define FW_BUILD_TIME                           __TIME__
 
 // WiFi event bits
 #define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT      BIT1
 
 #define OTA_BUFFER_SIZE 4096
 #define OTA_MAX_RETRIES 3
@@ -43,9 +54,132 @@ static char MQTT_PYTHON_OUTPUT_TOPIC[MAX_STR_LEN*2];
 
 // WiFi and MQTT variables
 static EventGroupHandle_t s_wifi_event_group;
-static int s_retry_num = 0;
 static esp_mqtt_client_handle_t mqtt_client = NULL;
 static const char *TAG = "mqtt_handler";
+
+static const uint32_t WIFI_RECONNECT_BACKOFF_MS[WIFI_RECONNECT_BACKOFF_STEPS] = {1000, 2000, 5000, 10000, WIFI_RECONNECT_BACKOFF_MAX_MS};
+
+typedef struct {
+    bool wifi_connected;
+    bool mqtt_connected;
+    bool recovery_guard;
+    TickType_t boot_tick;
+    TickType_t last_wifi_disconnect_tick;
+    TickType_t last_ip_tick;
+    TickType_t last_mqtt_disconnect_tick;
+    TickType_t next_wifi_reconnect_tick;
+    TickType_t last_recovery_action_tick;
+    uint32_t wifi_reconnect_attempt;
+} connection_recovery_state_t;
+
+static connection_recovery_state_t s_recovery = {0};
+
+static char s_broker_uri[MAX_STR_LEN] = {0};
+static char s_mqtt_username[MAX_STR_LEN] = {0};
+static char s_mqtt_password[MAX_STR_LEN] = {0};
+static char s_client_id[MAX_STR_LEN] = {0};
+
+static uint32_t elapsed_ms_since(TickType_t from_tick) {
+    return (uint32_t)(pdTICKS_TO_MS(xTaskGetTickCount() - from_tick));
+}
+
+static TickType_t backoff_to_ticks(uint32_t backoff_ms)
+{
+    return pdMS_TO_TICKS(backoff_ms);
+}
+
+static bool broker_uses_domain(const char *uri, char *host, size_t host_size)
+{
+    if (!uri || !host || host_size == 0) {
+        return false;
+    }
+
+    const char *scheme = strstr(uri, "://");
+    const char *start = scheme ? scheme + 3 : uri;
+    const char *end = start;
+    while (*end && *end != ':' && *end != '/' && *end != '?') {
+        end++;
+    }
+
+    size_t len = (size_t)(end - start);
+    if (len == 0 || len >= host_size) {
+        return false;
+    }
+
+    memcpy(host, start, len);
+    host[len] = '\0';
+
+    for (size_t i = 0; i < len; i++) {
+        if ((host[i] < '0' || host[i] > '9') && host[i] != '.') {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void log_broker_dns_resolution(void)
+{
+    char host[128] = {0};
+    if (!broker_uses_domain(s_broker_uri, host, sizeof(host))) {
+        return;
+    }
+
+    struct addrinfo hints = {0};
+    struct addrinfo *result = NULL;
+    hints.ai_socktype = SOCK_STREAM;
+    int err = getaddrinfo(host, NULL, &hints, &result);
+    if (err != 0) {
+        ESP_LOGW(TAG, "DNS lookup failed for broker host %s: %d", host, err);
+        return;
+    }
+
+    for (struct addrinfo *rp = result; rp != NULL; rp = rp->ai_next) {
+        char ipstr[INET6_ADDRSTRLEN] = {0};
+        void *addr_ptr = NULL;
+        if (rp->ai_family == AF_INET) {
+            struct sockaddr_in *ipv4 = (struct sockaddr_in *)rp->ai_addr;
+            addr_ptr = &ipv4->sin_addr;
+        } else if (rp->ai_family == AF_INET6) {
+            struct sockaddr_in6 *ipv6 = (struct sockaddr_in6 *)rp->ai_addr;
+            addr_ptr = &ipv6->sin6_addr;
+        }
+
+        if (addr_ptr && inet_ntop(rp->ai_family, addr_ptr, ipstr, sizeof(ipstr))) {
+            ESP_LOGI(TAG, "Broker DNS resolved: host=%s family=%d addr=%s", host, rp->ai_family, ipstr);
+        }
+    }
+
+    freeaddrinfo(result);
+}
+
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
+
+static void restart_mqtt_client(void)
+{
+    if (mqtt_client) {
+        esp_mqtt_client_stop(mqtt_client);
+        esp_mqtt_client_destroy(mqtt_client);
+        mqtt_client = NULL;
+    }
+
+    esp_mqtt_client_config_t mqtt_cfg = {};
+    mqtt_cfg.broker.address.uri = s_broker_uri;
+    mqtt_cfg.credentials.username = s_mqtt_username;
+    mqtt_cfg.credentials.authentication.password = s_mqtt_password;
+    mqtt_cfg.credentials.client_id = s_client_id;
+
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    if (!mqtt_client) {
+        ESP_LOGE(TAG, "Failed to initialize MQTT client");
+        return;
+    }
+
+    esp_mqtt_client_register_event(mqtt_client, (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(mqtt_client);
+    s_recovery.last_mqtt_disconnect_tick = xTaskGetTickCount();
+    ESP_LOGI(TAG, "MQTT client restarted");
+}
 
 // External flag for ADC measurement
 extern bool get_measure_adc_flag(void);
@@ -189,6 +323,43 @@ static void stop_motors_for_reset(void) {
     machine_pwm_deinit_all();
 }
 
+static const char *reset_reason_to_str(esp_reset_reason_t reason)
+{
+    switch (reason) {
+    case ESP_RST_UNKNOWN: return "unknown";
+    case ESP_RST_POWERON: return "power_on";
+    case ESP_RST_EXT: return "external";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "int_wdt";
+    case ESP_RST_TASK_WDT: return "task_wdt";
+    case ESP_RST_WDT: return "other_wdt";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_SDIO: return "sdio";
+    default: return "other";
+    }
+}
+
+static void publish_firmware_version(esp_mqtt_client_handle_t client)
+{
+    if (!client) {
+        return;
+    }
+
+    esp_reset_reason_t reason = esp_reset_reason();
+    char response[192];
+    snprintf(response,
+             sizeof(response),
+             "{\"type\":\"hello\",\"fw_version\":\"%s\",\"build_date\":\"%s\",\"build_time\":\"%s\",\"reset_reason\":\"%s\"}",
+             FW_VERSION,
+             FW_BUILD_DATE,
+             FW_BUILD_TIME,
+             reset_reason_to_str(reason));
+    int msg_id = esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
+    ESP_LOGI(TAG, "sent firmware hello publish, msg_id=%d", msg_id);
+}
+
 static void process_system_input_message(esp_mqtt_client_handle_t client, const char *data, int data_len) {
     if (!data || data_len <= 0) {
         ESP_LOGW(TAG, "Empty MQTT payload on system input topic");
@@ -211,6 +382,9 @@ static void process_system_input_message(esp_mqtt_client_handle_t client, const 
             snprintf(response, sizeof(response), "{\"msg\":\"pong\"}");
             esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
             ESP_LOGI(TAG, "Responded to ping command");
+        } else if (strcmp(command->valuestring, "version") == 0) {
+            publish_firmware_version(client);
+            ESP_LOGI(TAG, "Responded to version command");
         } else if (strcmp(command->valuestring, "py") == 0) {
             cJSON *value = cJSON_GetObjectItemCaseSensitive(json, "value");
             if (cJSON_IsString(value) && (value->valuestring != NULL)) {
@@ -728,21 +902,54 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                               int32_t event_id, void *event_data)
 {
     ESP_LOGI(TAG, "WiFi EVENT type %s id %d", event_base, (int)event_id);
+    TickType_t now = xTaskGetTickCount();
+
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        s_recovery.boot_tick = now;
+        s_recovery.last_wifi_disconnect_tick = now;
+        s_recovery.last_ip_tick = now;
+        s_recovery.last_mqtt_disconnect_tick = now;
+        s_recovery.next_wifi_reconnect_tick = now;
+        s_recovery.wifi_reconnect_attempt = 0;
+        s_recovery.wifi_connected = false;
+        s_recovery.mqtt_connected = false;
+        s_recovery.recovery_guard = false;
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_num < EXAMPLE_ESP_MAXIMUM_RETRY) {
-            esp_wifi_connect();
-            s_retry_num++;
-            ESP_LOGI(TAG, "retry to connect to the AP");
-        } else {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        wifi_event_sta_disconnected_t *disconn = (wifi_event_sta_disconnected_t *)event_data;
+        s_recovery.wifi_connected = false;
+        s_recovery.mqtt_connected = false;
+        s_recovery.last_wifi_disconnect_tick = now;
+        s_recovery.last_mqtt_disconnect_tick = now;
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+
+        uint32_t idx = s_recovery.wifi_reconnect_attempt;
+        if (idx >= WIFI_RECONNECT_BACKOFF_STEPS) {
+            idx = WIFI_RECONNECT_BACKOFF_STEPS - 1;
         }
-        ESP_LOGI(TAG, "connect to the AP fail");
+        uint32_t backoff_ms = WIFI_RECONNECT_BACKOFF_MS[idx];
+        if (backoff_ms > WIFI_RECONNECT_BACKOFF_MAX_MS) {
+            backoff_ms = WIFI_RECONNECT_BACKOFF_MAX_MS;
+        }
+        s_recovery.next_wifi_reconnect_tick = now + backoff_to_ticks(backoff_ms);
+        s_recovery.wifi_reconnect_attempt++;
+
+        ESP_LOGW(TAG, "WiFi disconnected, reason=%d, reconnect in %u ms (attempt=%u)",
+                 disconn ? disconn->reason : -1,
+                 (unsigned)backoff_ms,
+                 (unsigned)s_recovery.wifi_reconnect_attempt);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
-        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
-        s_retry_num = 0;
+        ESP_LOGI(TAG, "got ip:" IPSTR " gateway:" IPSTR " mask:" IPSTR,
+                 IP2STR(&event->ip_info.ip),
+                 IP2STR(&event->ip_info.gw),
+                 IP2STR(&event->ip_info.netmask));
+        s_recovery.wifi_connected = true;
+        s_recovery.last_ip_tick = now;
+        s_recovery.last_wifi_disconnect_tick = now;
+        s_recovery.wifi_reconnect_attempt = 0;
+        s_recovery.next_wifi_reconnect_tick = now;
+        s_recovery.recovery_guard = false;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
@@ -758,20 +965,22 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
-        
+        s_recovery.mqtt_connected = true;
+        s_recovery.last_mqtt_disconnect_tick = xTaskGetTickCount();
+        s_recovery.recovery_guard = false;
+
         // Subscribe to topic
         msg_id = esp_mqtt_client_subscribe(client, MQTT_SYSTEM_INPUT_TOPIC, 1);
         ESP_LOGI(TAG, "sent subscribe to command topic, msg_id=%d", msg_id);
         
-        // Publish status
-        char response[64];
-        snprintf(response, sizeof(response), "{\"type\":\"hello\", \"msg\":\"version 20.09.2025\"}");
-        msg_id = esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
-        ESP_LOGI(TAG, "sent status publish, msg_id=%d", msg_id);
+        // Publish firmware identity
+        publish_firmware_version(client);
         break;
         
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+        s_recovery.mqtt_connected = false;
+        s_recovery.last_mqtt_disconnect_tick = xTaskGetTickCount();
         reset_all_partial_messages();
         break;
 
@@ -869,6 +1078,17 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     }
     case MQTT_EVENT_ERROR:
         ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
+        s_recovery.mqtt_connected = false;
+        s_recovery.last_mqtt_disconnect_tick = xTaskGetTickCount();
+        if (event->error_handle) {
+            ESP_LOGE(TAG, "MQTT_EVENT_ERROR_TYPE=%d esp_tls_last_esp_err=0x%x tls_stack_err=0x%x sock_errno=%d connect_return_code=0x%x",
+                     event->error_handle->error_type,
+                     event->error_handle->esp_tls_last_esp_err,
+                     event->error_handle->esp_tls_stack_err,
+                     event->error_handle->esp_transport_sock_errno,
+                     event->error_handle->connect_return_code);
+        }
+        log_broker_dns_resolution();
         reset_all_partial_messages();
         break;
         
@@ -927,27 +1147,29 @@ static void wifi_init_sta()
 
     ESP_LOGI(TAG, "wifi_init_sta finished.");
 
-    // Wait for connection
+    // Wait only briefly for initial connection; recovery logic continues in mqtt_task.
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-                                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                           WIFI_CONNECTED_BIT,
                                            pdFALSE,
                                            pdFALSE,
-                                           portMAX_DELAY);
+                                           pdMS_TO_TICKS(WIFI_INITIAL_CONNECT_WAIT_MS));
 
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
                  wssid, wpass);
-    } else if (bits & WIFI_FAIL_BIT) {
-        ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
-                wssid, wpass);
     } else {
-        ESP_LOGE(TAG, "UNEXPECTED EVENT");
+        ESP_LOGW(TAG, "Initial WiFi connect timed out after %d ms; continuing with recovery loop", WIFI_INITIAL_CONNECT_WAIT_MS);
     }
 }
 
 // MQTT task running on core 1
 void mqtt_task(void *pvParameter) {
     ESP_LOGI(TAG, "Starting MQTT task on core %d", xPortGetCoreID());
+    ESP_LOGI(TAG, "Firmware version=%s build=%s %s reset_reason=%s",
+             FW_VERSION,
+             FW_BUILD_DATE,
+             FW_BUILD_TIME,
+             reset_reason_to_str(esp_reset_reason()));
 
     const esp_partition_t *running = esp_ota_get_running_partition();
     ESP_LOGI(TAG, "Running partition: %s at 0x%lx", running->label, running->address);
@@ -972,18 +1194,14 @@ void mqtt_task(void *pvParameter) {
     
     // Initialize MQTT client
     esp_mqtt_client_config_t mqtt_cfg = {};
-    char broker_uri[MAX_STR_LEN];
-    char mqtt_username[MAX_STR_LEN];
-    char mqtt_password[MAX_STR_LEN];
-    char client_id[MAX_STR_LEN];
-    get_string_setting("broker_uri", broker_uri, sizeof(broker_uri));
-    get_string_setting("mqtt_username", mqtt_username, sizeof(mqtt_username));
-    get_string_setting("mqtt_password", mqtt_password, sizeof(mqtt_password));
-    get_string_setting("client_id", client_id, sizeof(client_id));
-    mqtt_cfg.broker.address.uri = broker_uri;
-    mqtt_cfg.credentials.username = mqtt_username;
-    mqtt_cfg.credentials.authentication.password = mqtt_password;
-    mqtt_cfg.credentials.client_id = client_id;
+    get_string_setting("broker_uri", s_broker_uri, sizeof(s_broker_uri));
+    get_string_setting("mqtt_username", s_mqtt_username, sizeof(s_mqtt_username));
+    get_string_setting("mqtt_password", s_mqtt_password, sizeof(s_mqtt_password));
+    get_string_setting("client_id", s_client_id, sizeof(s_client_id));
+    mqtt_cfg.broker.address.uri = s_broker_uri;
+    mqtt_cfg.credentials.username = s_mqtt_username;
+    mqtt_cfg.credentials.authentication.password = s_mqtt_password;
+    mqtt_cfg.credentials.client_id = s_client_id;
     
     char topic_system[MAX_STR_LEN];
     char topic_python[MAX_STR_LEN];
@@ -1006,6 +1224,54 @@ void mqtt_task(void *pvParameter) {
     
     while (1) {
         reset_watchdog();
+
+        TickType_t now = xTaskGetTickCount();
+
+        if (!s_recovery.wifi_connected && now >= s_recovery.next_wifi_reconnect_tick) {
+            ESP_LOGI(TAG, "Recovery L1: WiFi reconnect attempt=%u", (unsigned)s_recovery.wifi_reconnect_attempt);
+            esp_wifi_connect();
+            uint32_t idx = s_recovery.wifi_reconnect_attempt;
+            if (idx >= WIFI_RECONNECT_BACKOFF_STEPS) {
+                idx = WIFI_RECONNECT_BACKOFF_STEPS - 1;
+            }
+            uint32_t backoff_ms = WIFI_RECONNECT_BACKOFF_MS[idx];
+            if (backoff_ms > WIFI_RECONNECT_BACKOFF_MAX_MS) {
+                backoff_ms = WIFI_RECONNECT_BACKOFF_MAX_MS;
+            }
+            s_recovery.next_wifi_reconnect_tick = now + backoff_to_ticks(backoff_ms);
+            s_recovery.wifi_reconnect_attempt++;
+        }
+
+        if (!s_recovery.recovery_guard && !s_recovery.wifi_connected && elapsed_ms_since(s_recovery.last_ip_tick) >= WIFI_IP_RECOVERY_TIMEOUT_MS) {
+            s_recovery.recovery_guard = true;
+            s_recovery.last_recovery_action_tick = now;
+            ESP_LOGW(TAG, "Recovery L2: WiFi reinit after %u ms without IP", (unsigned)elapsed_ms_since(s_recovery.last_ip_tick));
+            esp_wifi_disconnect();
+            esp_wifi_stop();
+            esp_wifi_start();
+            esp_wifi_connect();
+            s_recovery.wifi_reconnect_attempt = 0;
+            s_recovery.next_wifi_reconnect_tick = now;
+        }
+
+        if (!s_recovery.recovery_guard && s_recovery.wifi_connected && !s_recovery.mqtt_connected && elapsed_ms_since(s_recovery.last_mqtt_disconnect_tick) >= MQTT_RECOVERY_TIMEOUT_MS) {
+            s_recovery.recovery_guard = true;
+            s_recovery.last_recovery_action_tick = now;
+            ESP_LOGW(TAG, "Recovery L3: MQTT client restart after %u ms disconnected", (unsigned)elapsed_ms_since(s_recovery.last_mqtt_disconnect_tick));
+            restart_mqtt_client();
+        }
+
+        if (s_recovery.recovery_guard && elapsed_ms_since(s_recovery.last_recovery_action_tick) >= RECOVERY_GUARD_COOLDOWN_MS) {
+            s_recovery.recovery_guard = false;
+        }
+
+#if ENABLE_OFFLINE_FALLBACK_RESTART
+        if (!s_recovery.wifi_connected && !s_recovery.mqtt_connected && elapsed_ms_since(s_recovery.last_ip_tick) >= OFFLINE_RESTART_TIMEOUT_MS) {
+            ESP_LOGE(TAG, "Recovery L4 fallback: restart after %u ms offline", (unsigned)elapsed_ms_since(s_recovery.last_ip_tick));
+            stop_motors_for_reset();
+            esp_restart();
+        }
+#endif
         // check watchdog
         //vTaskDelay(pdMS_TO_TICKS(15000));
         // Handle MQTT print stream
