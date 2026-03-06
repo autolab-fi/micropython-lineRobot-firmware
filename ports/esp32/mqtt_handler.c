@@ -35,6 +35,9 @@
 #define RECOVERY_GUARD_COOLDOWN_MS             5000
 #define ENABLE_OFFLINE_FALLBACK_RESTART        1
 #define WIFI_INITIAL_CONNECT_WAIT_MS            15000
+#define WIFI_RECONNECT_FAIL_REBOOT_THRESHOLD    20
+#define WIFI_RECONNECT_FAIL_WINDOW_MS           300000
+#define WIFI_RECONNECT_FAIL_MIN_UPTIME_MS       60000
 
 // WiFi event bits
 #define WIFI_CONNECTED_BIT BIT0
@@ -67,6 +70,8 @@ typedef struct {
     TickType_t next_wifi_reconnect_tick;
     TickType_t last_recovery_action_tick;
     uint32_t wifi_reconnect_attempt;
+    uint32_t wifi_fail_streak;
+    TickType_t wifi_fail_window_start;
 } connection_recovery_state_t;
 
 static connection_recovery_state_t s_recovery = {0};
@@ -75,6 +80,10 @@ static char s_broker_uri[MAX_STR_LEN] = {0};
 static char s_mqtt_username[MAX_STR_LEN] = {0};
 static char s_mqtt_password[MAX_STR_LEN] = {0};
 static char s_client_id[MAX_STR_LEN] = {0};
+
+static uint32_t s_wifi_reconnect_fail_reboot_threshold = WIFI_RECONNECT_FAIL_REBOOT_THRESHOLD;
+static uint32_t s_wifi_reconnect_fail_window_ms = WIFI_RECONNECT_FAIL_WINDOW_MS;
+static uint32_t s_wifi_reconnect_fail_min_uptime_ms = WIFI_RECONNECT_FAIL_MIN_UPTIME_MS;
 
 static uint32_t elapsed_ms_since(TickType_t from_tick) {
     return (uint32_t)(pdTICKS_TO_MS(xTaskGetTickCount() - from_tick));
@@ -868,6 +877,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         s_recovery.last_mqtt_disconnect_tick = now;
         s_recovery.next_wifi_reconnect_tick = now;
         s_recovery.wifi_reconnect_attempt = 0;
+        s_recovery.wifi_fail_streak = 0;
+        s_recovery.wifi_fail_window_start = now;
         s_recovery.wifi_connected = false;
         s_recovery.mqtt_connected = false;
         s_recovery.recovery_guard = false;
@@ -878,6 +889,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         s_recovery.mqtt_connected = false;
         s_recovery.last_wifi_disconnect_tick = now;
         s_recovery.last_mqtt_disconnect_tick = now;
+        if (s_recovery.wifi_fail_streak == 0) {
+            s_recovery.wifi_fail_window_start = now;
+        }
+        s_recovery.wifi_fail_streak++;
         xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
 
         uint32_t idx = s_recovery.wifi_reconnect_attempt;
@@ -891,10 +906,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         s_recovery.next_wifi_reconnect_tick = now + backoff_to_ticks(backoff_ms);
         s_recovery.wifi_reconnect_attempt++;
 
-        ESP_LOGW(TAG, "WiFi disconnected, reason=%d, reconnect in %u ms (attempt=%u)",
+        ESP_LOGW(TAG, "WiFi disconnected, reason=%d, reconnect in %u ms (attempt=%u, fail_streak=%u, fail_window_elapsed=%u ms)",
                  disconn ? disconn->reason : -1,
                  (unsigned)backoff_ms,
-                 (unsigned)s_recovery.wifi_reconnect_attempt);
+                 (unsigned)s_recovery.wifi_reconnect_attempt,
+                 (unsigned)s_recovery.wifi_fail_streak,
+                 (unsigned)elapsed_ms_since(s_recovery.wifi_fail_window_start));
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
         ESP_LOGI(TAG, "got ip:" IPSTR " gateway:" IPSTR " mask:" IPSTR,
@@ -905,6 +922,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         s_recovery.last_ip_tick = now;
         s_recovery.last_wifi_disconnect_tick = now;
         s_recovery.wifi_reconnect_attempt = 0;
+        s_recovery.wifi_fail_streak = 0;
+        s_recovery.wifi_fail_window_start = now;
         s_recovery.next_wifi_reconnect_tick = now;
         s_recovery.recovery_guard = false;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
@@ -1162,6 +1181,22 @@ void mqtt_task(void *pvParameter) {
     char topic_python[MAX_STR_LEN];
     get_string_setting("topic_system", topic_system, sizeof(topic_system));
     get_string_setting("topic_python", topic_python, sizeof(topic_python));
+    s_wifi_reconnect_fail_reboot_threshold = (uint32_t)get_int_setting(
+        "wifi_reconnect_fail_reboot_threshold",
+        WIFI_RECONNECT_FAIL_REBOOT_THRESHOLD
+    );
+    s_wifi_reconnect_fail_window_ms = (uint32_t)get_int_setting(
+        "wifi_reconnect_fail_window_ms",
+        WIFI_RECONNECT_FAIL_WINDOW_MS
+    );
+    s_wifi_reconnect_fail_min_uptime_ms = (uint32_t)get_int_setting(
+        "wifi_reconnect_fail_min_uptime_ms",
+        WIFI_RECONNECT_FAIL_MIN_UPTIME_MS
+    );
+    ESP_LOGI(TAG, "WiFi fail reboot settings: threshold=%u window=%u ms min_uptime=%u ms",
+             (unsigned)s_wifi_reconnect_fail_reboot_threshold,
+             (unsigned)s_wifi_reconnect_fail_window_ms,
+             (unsigned)s_wifi_reconnect_fail_min_uptime_ms);
     snprintf(MQTT_PYTHON_OUTPUT_TOPIC, MAX_STR_LEN*2, "%s/output", topic_python);
     snprintf(MQTT_SYSTEM_OUTPUT_TOPIC, MAX_STR_LEN*2, "%s/output", topic_system);
     snprintf(MQTT_SYSTEM_INPUT_TOPIC, MAX_STR_LEN*2, "%s/input", topic_system);
@@ -1181,6 +1216,26 @@ void mqtt_task(void *pvParameter) {
         reset_watchdog();
 
         TickType_t now = xTaskGetTickCount();
+
+        if (!s_recovery.wifi_connected && s_recovery.wifi_fail_streak > 0 &&
+            elapsed_ms_since(s_recovery.wifi_fail_window_start) > s_wifi_reconnect_fail_window_ms) {
+            ESP_LOGW(TAG, "WiFi fail window expired after %u ms without IP, reset fail streak=%u",
+                     (unsigned)elapsed_ms_since(s_recovery.wifi_fail_window_start),
+                     (unsigned)s_recovery.wifi_fail_streak);
+            s_recovery.wifi_fail_streak = 0;
+            s_recovery.wifi_fail_window_start = now;
+        }
+
+        if (s_wifi_reconnect_fail_reboot_threshold > 0 &&
+            s_recovery.wifi_fail_streak >= s_wifi_reconnect_fail_reboot_threshold &&
+            elapsed_ms_since(s_recovery.wifi_fail_window_start) <= s_wifi_reconnect_fail_window_ms &&
+            elapsed_ms_since(s_recovery.boot_tick) >= s_wifi_reconnect_fail_min_uptime_ms) {
+            ESP_LOGE(TAG, "Recovery L5: reboot after %u failed reconnects in %u ms",
+                     (unsigned)s_recovery.wifi_fail_streak,
+                     (unsigned)elapsed_ms_since(s_recovery.wifi_fail_window_start));
+            stop_motors_for_reset();
+            esp_restart();
+        }
 
         if (!s_recovery.wifi_connected && now >= s_recovery.next_wifi_reconnect_tick) {
             ESP_LOGI(TAG, "Recovery L1: WiFi reconnect attempt=%u", (unsigned)s_recovery.wifi_reconnect_attempt);
