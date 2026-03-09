@@ -5,6 +5,7 @@
 #include "esp_ota_ops.h"
 #include "esp_task_wdt.h"
 #include "esp_partition.h"
+#include "esp_timer.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -34,6 +35,7 @@
 #define OFFLINE_RESTART_TIMEOUT_MS             (15 * 60 * 1000)
 #define RECOVERY_GUARD_COOLDOWN_MS             5000
 #define RECOVERY_STATUS_LOG_INTERVAL_MS         5000
+#define MQTT_STABLE_CONNECTED_MS                30000
 #define ENABLE_OFFLINE_FALLBACK_RESTART        1
 #define WIFI_INITIAL_CONNECT_WAIT_MS            15000
 
@@ -61,6 +63,7 @@ typedef struct {
     bool wifi_connected;
     bool mqtt_connected;
     bool recovery_guard;
+    bool recovery_state_initialized;
     TickType_t boot_tick;
     TickType_t last_wifi_disconnect_tick;
     TickType_t last_ip_tick;
@@ -70,6 +73,10 @@ typedef struct {
     TickType_t last_status_log_tick;
     uint32_t wifi_reconnect_attempt;
     int32_t last_disconnect_reason;
+    uint64_t outage_start_ms;
+    uint64_t got_ip_ms;
+    uint64_t mqtt_connected_since_ms;
+    uint8_t recovery_level;
 } connection_recovery_state_t;
 
 static connection_recovery_state_t s_recovery = {0};
@@ -81,6 +88,46 @@ static char s_client_id[MAX_STR_LEN] = {0};
 
 static uint32_t elapsed_ms_since(TickType_t from_tick) {
     return (uint32_t)(pdTICKS_TO_MS(xTaskGetTickCount() - from_tick));
+}
+
+static uint64_t monotonic_ms(void)
+{
+    return (uint64_t)(esp_timer_get_time() / 1000ULL);
+}
+
+static void recovery_note_degradation(uint8_t level)
+{
+    uint64_t now_ms = monotonic_ms();
+    if (s_recovery.outage_start_ms == 0) {
+        s_recovery.outage_start_ms = now_ms;
+    }
+    if (level > s_recovery.recovery_level) {
+        s_recovery.recovery_level = level;
+    }
+}
+
+static void recovery_reset_if_stable(void)
+{
+    if (s_recovery.outage_start_ms == 0 || !s_recovery.wifi_connected || !s_recovery.mqtt_connected) {
+        return;
+    }
+    if (s_recovery.got_ip_ms == 0 || s_recovery.mqtt_connected_since_ms == 0) {
+        return;
+    }
+
+    uint64_t stable_from_ms = s_recovery.got_ip_ms;
+    if (s_recovery.mqtt_connected_since_ms > stable_from_ms) {
+        stable_from_ms = s_recovery.mqtt_connected_since_ms;
+    }
+
+    uint64_t now_ms = monotonic_ms();
+    if (now_ms >= stable_from_ms && (now_ms - stable_from_ms) >= MQTT_STABLE_CONNECTED_MS) {
+        ESP_LOGI(TAG, "Recovery reset: stable WiFi+MQTT for %u ms (outage lasted %llu ms)",
+                 (unsigned)MQTT_STABLE_CONNECTED_MS,
+                 (unsigned long long)(now_ms - s_recovery.outage_start_ms));
+        s_recovery.outage_start_ms = 0;
+        s_recovery.recovery_level = 0;
+    }
 }
 
 static uint32_t elapsed_ms_between(TickType_t now, TickType_t from_tick)
@@ -117,16 +164,22 @@ static void log_recovery_timers(TickType_t now)
 
     uint32_t offline_elapsed_ms = elapsed_ip_ms;
     uint32_t to_l4_ms = 0;
-    if (offline_elapsed_ms < OFFLINE_RESTART_TIMEOUT_MS) {
-        to_l4_ms = OFFLINE_RESTART_TIMEOUT_MS - offline_elapsed_ms;
+    if (s_recovery.outage_start_ms > 0) {
+        uint64_t outage_elapsed_ms = monotonic_ms() - s_recovery.outage_start_ms;
+        if (outage_elapsed_ms < OFFLINE_RESTART_TIMEOUT_MS) {
+            to_l4_ms = OFFLINE_RESTART_TIMEOUT_MS - outage_elapsed_ms;
+        }
+    } else {
+        to_l4_ms = OFFLINE_RESTART_TIMEOUT_MS;
     }
 
     if (l3_active) {
         ESP_LOGI(TAG,
-                 "RecoveryStatus: wifi=%d mqtt=%d guard=%d attempt=%u reason=%ld toL1=%ums toL2=%ums toL3=%ums toL4=%ums",
+                 "RecoveryStatus: wifi=%d mqtt=%d guard=%d lvl=%u attempt=%u reason=%ld toL1=%ums toL2=%ums toL3=%ums toL4=%ums",
                  s_recovery.wifi_connected,
                  s_recovery.mqtt_connected,
                  s_recovery.recovery_guard,
+                 (unsigned)s_recovery.recovery_level,
                  (unsigned)s_recovery.wifi_reconnect_attempt,
                  (long)s_recovery.last_disconnect_reason,
                  (unsigned)to_l1_ms,
@@ -135,10 +188,11 @@ static void log_recovery_timers(TickType_t now)
                  (unsigned)to_l4_ms);
     } else {
         ESP_LOGI(TAG,
-                 "RecoveryStatus: wifi=%d mqtt=%d guard=%d attempt=%u reason=%ld toL1=%ums toL2=%ums toL3=n/a toL4=%ums",
+                 "RecoveryStatus: wifi=%d mqtt=%d guard=%d lvl=%u attempt=%u reason=%ld toL1=%ums toL2=%ums toL3=n/a toL4=%ums",
                  s_recovery.wifi_connected,
                  s_recovery.mqtt_connected,
                  s_recovery.recovery_guard,
+                 (unsigned)s_recovery.recovery_level,
                  (unsigned)s_recovery.wifi_reconnect_attempt,
                  (long)s_recovery.last_disconnect_reason,
                  (unsigned)to_l1_ms,
@@ -929,17 +983,24 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     TickType_t now = xTaskGetTickCount();
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        s_recovery.boot_tick = now;
-        s_recovery.last_wifi_disconnect_tick = now;
+        if (!s_recovery.recovery_state_initialized) {
+            s_recovery.boot_tick = now;
+            s_recovery.last_status_log_tick = now;
+            s_recovery.last_disconnect_reason = -1;
+            s_recovery.outage_start_ms = 0;
+            s_recovery.recovery_level = 0;
+            s_recovery.recovery_state_initialized = true;
+            s_recovery.recovery_guard = false;
+        }
         s_recovery.last_ip_tick = now;
+        s_recovery.last_wifi_disconnect_tick = now;
         s_recovery.last_mqtt_disconnect_tick = now;
+        s_recovery.got_ip_ms = 0;
+        s_recovery.mqtt_connected_since_ms = 0;
         s_recovery.next_wifi_reconnect_tick = now;
         s_recovery.wifi_reconnect_attempt = 0;
-        s_recovery.last_status_log_tick = now;
-        s_recovery.last_disconnect_reason = -1;
         s_recovery.wifi_connected = false;
         s_recovery.mqtt_connected = false;
-        s_recovery.recovery_guard = false;
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *disconn = (wifi_event_sta_disconnected_t *)event_data;
@@ -947,7 +1008,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         s_recovery.mqtt_connected = false;
         s_recovery.last_wifi_disconnect_tick = now;
         s_recovery.last_mqtt_disconnect_tick = now;
+        s_recovery.got_ip_ms = 0;
+        s_recovery.mqtt_connected_since_ms = 0;
         s_recovery.last_disconnect_reason = disconn ? disconn->reason : -1;
+        recovery_note_degradation(1);
         xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
 
         uint32_t idx = s_recovery.wifi_reconnect_attempt;
@@ -973,6 +1037,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                  IP2STR(&event->ip_info.netmask));
         s_recovery.wifi_connected = true;
         s_recovery.last_ip_tick = now;
+        s_recovery.got_ip_ms = monotonic_ms();
         s_recovery.last_wifi_disconnect_tick = now;
         s_recovery.wifi_reconnect_attempt = 0;
         s_recovery.next_wifi_reconnect_tick = now;
@@ -993,6 +1058,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
         s_recovery.mqtt_connected = true;
+        s_recovery.mqtt_connected_since_ms = monotonic_ms();
         s_recovery.last_mqtt_disconnect_tick = xTaskGetTickCount();
         s_recovery.recovery_guard = false;
 
@@ -1002,7 +1068,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         
         // Publish status
         char response[64];
-        snprintf(response, sizeof(response), "{\"type\":\"hello\", \"msg\":\"version 20.09.2025\"}");
+        snprintf(response, sizeof(response), "{\"type\":\"hello\", \"msg\":\"version 09.03.2026\"}");
         msg_id = esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
         ESP_LOGI(TAG, "sent status publish, msg_id=%d", msg_id);
         break;
@@ -1010,7 +1076,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
         s_recovery.mqtt_connected = false;
+        s_recovery.mqtt_connected_since_ms = 0;
         s_recovery.last_mqtt_disconnect_tick = xTaskGetTickCount();
+        recovery_note_degradation(1);
         reset_all_partial_messages();
         break;
 
@@ -1109,7 +1177,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     case MQTT_EVENT_ERROR:
         ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
         s_recovery.mqtt_connected = false;
+        s_recovery.mqtt_connected_since_ms = 0;
         s_recovery.last_mqtt_disconnect_tick = xTaskGetTickCount();
+        recovery_note_degradation(1);
         if (event->error_handle) {
             ESP_LOGE(TAG, "MQTT_EVENT_ERROR_TYPE=%d esp_tls_last_esp_err=0x%x tls_stack_err=0x%x sock_errno=%d connect_return_code=0x%x",
                      event->error_handle->error_type,
@@ -1251,9 +1321,11 @@ void mqtt_task(void *pvParameter) {
         reset_watchdog();
 
         TickType_t now = xTaskGetTickCount();
+        recovery_reset_if_stable();
         log_recovery_timers(now);
 
         if (!s_recovery.wifi_connected && now >= s_recovery.next_wifi_reconnect_tick) {
+            recovery_note_degradation(1);
             ESP_LOGI(TAG, "Recovery L1: WiFi reconnect attempt=%u", (unsigned)s_recovery.wifi_reconnect_attempt);
             esp_wifi_connect();
             uint32_t idx = s_recovery.wifi_reconnect_attempt;
@@ -1271,6 +1343,7 @@ void mqtt_task(void *pvParameter) {
         if (!s_recovery.recovery_guard && !s_recovery.wifi_connected && elapsed_ms_since(s_recovery.last_ip_tick) >= WIFI_IP_RECOVERY_TIMEOUT_MS) {
             s_recovery.recovery_guard = true;
             s_recovery.last_recovery_action_tick = now;
+            recovery_note_degradation(2);
             ESP_LOGW(TAG, "Recovery L2: WiFi reinit after %u ms without IP", (unsigned)elapsed_ms_since(s_recovery.last_ip_tick));
             esp_wifi_disconnect();
             esp_wifi_stop();
@@ -1283,6 +1356,7 @@ void mqtt_task(void *pvParameter) {
         if (!s_recovery.recovery_guard && s_recovery.wifi_connected && !s_recovery.mqtt_connected && elapsed_ms_since(s_recovery.last_mqtt_disconnect_tick) >= MQTT_RECOVERY_TIMEOUT_MS) {
             s_recovery.recovery_guard = true;
             s_recovery.last_recovery_action_tick = now;
+            recovery_note_degradation(3);
             ESP_LOGW(TAG, "Recovery L3: MQTT client restart after %u ms disconnected", (unsigned)elapsed_ms_since(s_recovery.last_mqtt_disconnect_tick));
             restart_mqtt_client();
         }
@@ -1292,10 +1366,15 @@ void mqtt_task(void *pvParameter) {
         }
 
 #if ENABLE_OFFLINE_FALLBACK_RESTART
-        if (!s_recovery.wifi_connected && !s_recovery.mqtt_connected && elapsed_ms_since(s_recovery.last_ip_tick) >= OFFLINE_RESTART_TIMEOUT_MS) {
-            ESP_LOGE(TAG, "Recovery L4 fallback: restart after %u ms offline", (unsigned)elapsed_ms_since(s_recovery.last_ip_tick));
-            stop_motors_for_reset();
-            esp_restart();
+        if (s_recovery.outage_start_ms > 0) {
+            uint64_t now_ms = monotonic_ms();
+            uint64_t outage_elapsed_ms = now_ms - s_recovery.outage_start_ms;
+            if (outage_elapsed_ms >= OFFLINE_RESTART_TIMEOUT_MS) {
+                s_recovery.recovery_level = 4;
+                ESP_LOGE(TAG, "Recovery L4: restarting device after %llu ms outage", (unsigned long long)outage_elapsed_ms);
+                stop_motors_for_reset();
+                esp_restart();
+            }
         }
 #endif
         // check watchdog
