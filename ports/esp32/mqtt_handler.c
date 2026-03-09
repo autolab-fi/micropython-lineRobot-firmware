@@ -63,6 +63,7 @@ typedef struct {
     bool wifi_connected;
     bool mqtt_connected;
     bool recovery_guard;
+    bool recovery_state_initialized;
     TickType_t boot_tick;
     TickType_t last_wifi_disconnect_tick;
     TickType_t last_ip_tick;
@@ -982,18 +983,21 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     TickType_t now = xTaskGetTickCount();
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        s_recovery.boot_tick = now;
+        if (!s_recovery.recovery_state_initialized) {
+            s_recovery.boot_tick = now;
+            s_recovery.last_ip_tick = now;
+            s_recovery.last_status_log_tick = now;
+            s_recovery.last_disconnect_reason = -1;
+            s_recovery.outage_start_ms = 0;
+            s_recovery.recovery_level = 0;
+            s_recovery.recovery_state_initialized = true;
+        }
         s_recovery.last_wifi_disconnect_tick = now;
-        s_recovery.last_ip_tick = now;
         s_recovery.last_mqtt_disconnect_tick = now;
-        s_recovery.next_wifi_reconnect_tick = now;
-        s_recovery.wifi_reconnect_attempt = 0;
-        s_recovery.last_status_log_tick = now;
-        s_recovery.last_disconnect_reason = -1;
         s_recovery.got_ip_ms = 0;
         s_recovery.mqtt_connected_since_ms = 0;
-        s_recovery.outage_start_ms = 0;
-        s_recovery.recovery_level = 0;
+        s_recovery.next_wifi_reconnect_tick = now;
+        s_recovery.wifi_reconnect_attempt = 0;
         s_recovery.wifi_connected = false;
         s_recovery.mqtt_connected = false;
         s_recovery.recovery_guard = false;
@@ -1064,7 +1068,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         
         // Publish status
         char response[64];
-        snprintf(response, sizeof(response), "{\"type\":\"hello\", \"msg\":\"version 20.09.2025\"}");
+        snprintf(response, sizeof(response), "{\"type\":\"hello\", \"msg\":\"version 09.03.2026\"}");
         msg_id = esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
         ESP_LOGI(TAG, "sent status publish, msg_id=%d", msg_id);
         break;
