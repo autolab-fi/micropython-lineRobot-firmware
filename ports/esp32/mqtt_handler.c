@@ -985,13 +985,14 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         if (!s_recovery.recovery_state_initialized) {
             s_recovery.boot_tick = now;
-            s_recovery.last_ip_tick = now;
             s_recovery.last_status_log_tick = now;
             s_recovery.last_disconnect_reason = -1;
             s_recovery.outage_start_ms = 0;
             s_recovery.recovery_level = 0;
             s_recovery.recovery_state_initialized = true;
+            s_recovery.recovery_guard = false;
         }
+        s_recovery.last_ip_tick = now;
         s_recovery.last_wifi_disconnect_tick = now;
         s_recovery.last_mqtt_disconnect_tick = now;
         s_recovery.got_ip_ms = 0;
@@ -1000,7 +1001,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         s_recovery.wifi_reconnect_attempt = 0;
         s_recovery.wifi_connected = false;
         s_recovery.mqtt_connected = false;
-        s_recovery.recovery_guard = false;
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *disconn = (wifi_event_sta_disconnected_t *)event_data;
