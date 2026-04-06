@@ -88,6 +88,15 @@ import os\nfrom espidf import esp_vfs_spiffs_register, esp_vfs_spiffs_conf_t\nco
   "command": "battery-status"
 }
 
+{
+  "command": "auto-calibrate"
+}
+
+{
+  "command": "auto-calibrate",
+  "mode": "straight"
+}
+
 
 {
   "command": "py",

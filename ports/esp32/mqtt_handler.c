@@ -629,6 +629,33 @@ static void process_system_input_message(esp_mqtt_client_handle_t client, const 
         else if (strcmp(command->valuestring, "battery-status") == 0) {
             set_measure_adc_flag(true);
         }
+        else if (strcmp(command->valuestring, "auto-calibrate") == 0) {
+            cJSON *mode = cJSON_GetObjectItemCaseSensitive(json, "mode");
+            const char *mode_value = "straight";
+            if (cJSON_IsString(mode) && (mode->valuestring != NULL)) {
+                mode_value = mode->valuestring;
+            }
+
+            char *code = NULL;
+            if (strcmp(mode_value, "all") == 0) {
+                code = strdup("from calibration import auto_calibrate_all\nauto_calibrate_all()");
+            } else {
+                code = strdup("from calibration import auto_calibrate_straight\nauto_calibrate_straight()");
+            }
+
+            if (code != NULL) {
+                if (xQueueSend(python_code_queue, &code, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                    ESP_LOGE(TAG, "Failed to send calibration code to queue");
+                    free(code);
+                    esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC,
+                                           "{\"status\":\"error\",\"message\":\"Failed to queue auto calibration\"}", 0, 1, 0);
+                } else {
+                    ESP_LOGI(TAG, "Auto calibration queued with mode: %s", mode_value);
+                    esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC,
+                                           "{\"status\":\"queued\",\"message\":\"Auto calibration started\"}", 0, 1, 0);
+                }
+            }
+        }
         else if (strcmp(command->valuestring, "mark-valid") == 0) {
             esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
             if (err == ESP_OK) {
@@ -1068,7 +1095,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         
         // Publish status
         char response[64];
-        snprintf(response, sizeof(response), "{\"type\":\"hello\", \"msg\":\"version 06.04.2026\"}");
+        snprintf(response, sizeof(response), "{\"type\":\"hello\", \"msg\":\"calib-fw 07.04.2026\"}");
         msg_id = esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
         ESP_LOGI(TAG, "sent status publish, msg_id=%d", msg_id);
         break;
