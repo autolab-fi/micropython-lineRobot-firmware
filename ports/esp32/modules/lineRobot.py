@@ -370,11 +370,21 @@ class Robot:
     
     def set_block_true(self):
         """Enable blocking mode"""
+        self.stop()
         self.block = True
+
+    def set_block_false(self):
+        """Disable blocking mode"""
+        self.block = False
     
     def move_forward_speed_distance(self, sp, dist):
         """Move forward with specified speed for specified distance"""
         if self.block:
+            return
+        if abs(sp) == 0:
+            self.stop()
+            if self.debug:
+                print("move_forward_speed_distance skipped: speed is 0")
             return
             
         # Calculate target angle
@@ -400,7 +410,7 @@ class Robot:
             angle_right = self.encoder_radian_right()
             if c % 10 == 0 and self.debug:
                 print(f"Target: {self.target_angle:.2f}, Left: {angle_left:.2f}, Right: {angle_right:.2f}, integralL: {self.integral_ang_left:.2f}, integralR: {self.integral_ang_right:.2f}, prevErrL: {self.previous_err_ang_left:.2f}, prevErrR: {self.previous_err_ang_right:.2f}")
-                c+=1
+            c += 1
             # PID control for both motors
             left_motor_speed, self.integral_ang_left, self.previous_err_ang_left, self.last_time_left = \
                 self.compute_pid_angle_motor(self.target_angle - angle_left, self.kp_ang, 
@@ -423,11 +433,6 @@ class Robot:
                 power = self.constrain(0.5 + elapsed / 1000.0, 0.5, 1.0)
                 left_motor_speed = int(left_motor_speed * power)
                 right_motor_speed = int(right_motor_speed * power)
-
-            if elapsed < 800:
-                power = self.constrain(0.5 + elapsed / 1000.0, 0.5, 1.0)
-                left_motor_speed = int(left_motor_speed * power)
-                right_motor_speed = int(right_motor_speed * power)
             
             # Straight line correction
             if abs(self.previous_err_ang_left) < abs(self.previous_err_ang_right):
@@ -442,6 +447,11 @@ class Robot:
     def move_backward_speed_distance(self, sp, dist):
         """Move backward with specified speed for specified distance"""
         if self.block:
+            return
+        if abs(sp) == 0:
+            self.stop()
+            if self.debug:
+                print("move_backward_speed_distance skipped: speed is 0")
             return
             
         self.reset_encoders()
@@ -559,10 +569,12 @@ class Robot:
                 right_motor_speed = int(right_motor_speed * power)
             
             # Straight line correction
-            if abs(angle_left) > abs(angle_right):
-                right_motor_speed += int((angle_left - angle_right) * self.k_straight)
-            elif abs(angle_left) < abs(angle_right):
-                left_motor_speed += int((angle_right - angle_left) * self.k_straight)
+            abs_angle_left = abs(angle_left)
+            abs_angle_right = abs(angle_right)
+            if abs_angle_left > abs_angle_right:
+                right_motor_speed += int((abs_angle_left - abs_angle_right) * self.k_straight)
+            elif abs_angle_left < abs_angle_right:
+                left_motor_speed += int((abs_angle_right - abs_angle_left) * self.k_straight)
             
             self.run_motors_speed(-left_motor_speed, -right_motor_speed)
         self.stop()
