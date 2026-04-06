@@ -1068,7 +1068,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         
         // Publish status
         char response[64];
-        snprintf(response, sizeof(response), "{\"type\":\"hello\", \"msg\":\"version 09.03.2026\"}");
+        snprintf(response, sizeof(response), "{\"type\":\"hello\", \"msg\":\"version 06.04.2026\"}");
         msg_id = esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
         ESP_LOGI(TAG, "sent status publish, msg_id=%d", msg_id);
         break;

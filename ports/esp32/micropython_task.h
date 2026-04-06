@@ -6,6 +6,8 @@
 #include "freertos/queue.h"
 #include "freertos/stream_buffer.h"
 #include "esp_log.h"
+#include <stdbool.h>
+#include <stdint.h>
 
 // Task handle for MicroPython main task
 extern TaskHandle_t mp_main_task_handle;
@@ -32,6 +34,16 @@ void mp_task(void *pvParameter);
 void *esp_native_code_commit(void *buf, size_t len, void *reloc);
 void esp_native_code_free_all(void);
 void  execute_python_code(const char* code);
+
+// User-code execution guard helpers
+void mp_user_code_guard_task(void *pvParameter);
+bool mp_user_code_is_active(void);
+uint32_t mp_user_code_get_execution_id(void);
+TickType_t mp_user_code_get_deadline(void);
+bool mp_user_code_timeout_handled(void);
+void mp_user_code_force_stop(void);
+void mp_user_code_request_soft_interrupt(void);
+void mp_user_code_request_hard_restart(void);
 
 
 // NLR jump failure handler

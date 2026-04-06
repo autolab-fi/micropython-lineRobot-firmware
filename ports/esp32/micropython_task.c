@@ -22,6 +22,7 @@
 #include "py/gc.h"
 #include "py/mphal.h"
 #include "shared/readline/readline.h"
+#include "shared/runtime/interrupt_char.h"
 #include "shared/runtime/pyexec.h"
 #include "shared/timeutils/timeutils.h"
 #include "shared/tinyusb/mp_usbd.h"
@@ -29,6 +30,7 @@
 #include "uart.h"
 #include "usb.h"
 #include "usb_serial_jtag.h"
+#include "mphalport.h"
 #include "modmachine.h"
 #include "modnetwork.h"
 #include "settings_manager.h"
@@ -44,6 +46,9 @@
 
 // Constants
 #define MAX_STR_LEN 64
+#define USER_CODE_TIMEOUT_MS (70000)
+#define USER_CODE_RESTART_GRACE_MS (2000)
+#define USER_CODE_GUARD_POLL_MS (100)
 
 static const char *TAG = "micropython_task";
 
@@ -61,10 +66,35 @@ static bool measure_adc = false;
 // Python code storage
 static char* py_code = "";
 
+static volatile bool user_code_active = false;
+static volatile bool user_code_timeout_handled = false;
+static volatile uint32_t user_code_execution_id = 0;
+static volatile TickType_t user_code_deadline = 0;
+static volatile TickType_t user_code_interrupt_deadline = 0;
+
 // Python string argument structure
 typedef struct {
     const char *code;   // указатель на строку Python-кода
 } py_string_arg_t;
+
+static inline void mp_user_code_begin_execution(void) {
+    mp_uint_t atomic_state = MICROPY_BEGIN_ATOMIC_SECTION();
+    user_code_execution_id += 1;
+    user_code_active = true;
+    user_code_timeout_handled = false;
+    user_code_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(USER_CODE_TIMEOUT_MS);
+    user_code_interrupt_deadline = 0;
+    MICROPY_END_ATOMIC_SECTION(atomic_state);
+}
+
+static inline void mp_user_code_finish_execution(void) {
+    mp_uint_t atomic_state = MICROPY_BEGIN_ATOMIC_SECTION();
+    user_code_active = false;
+    user_code_timeout_handled = false;
+    user_code_deadline = 0;
+    user_code_interrupt_deadline = 0;
+    MICROPY_END_ATOMIC_SECTION(atomic_state);
+}
 
 // ADC flag functions
 bool get_measure_adc_flag(void) {
@@ -88,6 +118,76 @@ void  execute_python_code(const char* code){
         } else {
             ESP_LOGI(TAG, "Python code sent to execution queue: %s", code);
         }
+    }
+}
+
+bool mp_user_code_is_active(void) {
+    return user_code_active;
+}
+
+uint32_t mp_user_code_get_execution_id(void) {
+    return user_code_execution_id;
+}
+
+TickType_t mp_user_code_get_deadline(void) {
+    return user_code_deadline;
+}
+
+bool mp_user_code_timeout_handled(void) {
+    return user_code_timeout_handled;
+}
+
+void mp_user_code_force_stop(void) {
+    ESP_LOGE(TAG, "User code timeout: forcing PWM shutdown");
+    machine_pwm_deinit_all();
+}
+
+void mp_user_code_request_soft_interrupt(void) {
+    mp_uint_t atomic_state = MICROPY_BEGIN_ATOMIC_SECTION();
+    if (!user_code_active || user_code_timeout_handled) {
+        MICROPY_END_ATOMIC_SECTION(atomic_state);
+        return;
+    }
+    user_code_timeout_handled = true;
+    user_code_interrupt_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(USER_CODE_RESTART_GRACE_MS);
+    MICROPY_END_ATOMIC_SECTION(atomic_state);
+
+    ESP_LOGE(TAG, "User code timeout: scheduling KeyboardInterrupt");
+    mp_sched_keyboard_interrupt();
+}
+
+void mp_user_code_request_hard_restart(void) {
+    ESP_LOGE(TAG, "User code timeout: code did not exit after grace period, restarting");
+    esp_restart();
+}
+
+void mp_user_code_guard_task(void *pvParameter) {
+    uint32_t timed_out_execution_id = 0;
+
+    for (;;) {
+        bool active = mp_user_code_is_active();
+        TickType_t now = xTaskGetTickCount();
+
+        if (active && !mp_user_code_timeout_handled()) {
+            TickType_t deadline = mp_user_code_get_deadline();
+            if (deadline != 0 && (int32_t)(now - deadline) >= 0) {
+                timed_out_execution_id = mp_user_code_get_execution_id();
+                mp_user_code_force_stop();
+                mp_user_code_request_soft_interrupt();
+            }
+        } else if (active && mp_user_code_timeout_handled()) {
+            TickType_t interrupt_deadline = user_code_interrupt_deadline;
+            if (interrupt_deadline != 0
+                && timed_out_execution_id == mp_user_code_get_execution_id()
+                && (int32_t)(now - interrupt_deadline) >= 0) {
+                mp_user_code_force_stop();
+                mp_user_code_request_hard_restart();
+            }
+        } else {
+            timed_out_execution_id = 0;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(USER_CODE_GUARD_POLL_MS));
     }
 }
 
@@ -163,19 +263,20 @@ soft_reset:
             printf("Executing Python code: %s\n", py_code);
             py_string_arg_t codic = {py_code};
             py_string_arg_t *arg = &codic;
-            
-            mp_lexer_t *lex = mp_lexer_new_from_str_len(
-                MP_QSTR__lt_string_gt_, arg->code, strlen(arg->code), false
-            );
-            mp_parse_tree_t parse_tree = mp_parse(lex, MP_PARSE_FILE_INPUT);
-        
-            // Compile
-            mp_obj_t module_fun = mp_compile(&parse_tree,
-                                             MP_QSTR__lt_string_gt_,
-                                             false);
-        
+            mp_user_code_begin_execution();
+            ESP_LOGI(TAG, "User code execution started, timeout armed for %d ms", USER_CODE_TIMEOUT_MS);
+
             nlr_buf_t nlr;
             if (nlr_push(&nlr) == 0) {
+                mp_lexer_t *lex = mp_lexer_new_from_str_len(
+                    MP_QSTR__lt_string_gt_, arg->code, strlen(arg->code), false
+                );
+                mp_parse_tree_t parse_tree = mp_parse(lex, MP_PARSE_FILE_INPUT);
+
+                // Compile
+                mp_obj_t module_fun = mp_compile(&parse_tree,
+                                                 MP_QSTR__lt_string_gt_,
+                                                 false);
                 mp_call_function_0(module_fun);
                 nlr_pop();
                 
@@ -193,8 +294,9 @@ soft_reset:
                 free(received_code);
                 received_code = NULL;
             }
+            mp_user_code_finish_execution();
             py_code = "";
-            ESP_LOGI(TAG, "Python code executed successfully");
+            ESP_LOGI(TAG, "User code execution finished, timeout disarmed");
 
             goto soft_reset_exit;
         }

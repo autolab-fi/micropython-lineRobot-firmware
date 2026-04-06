@@ -144,6 +144,9 @@ void MICROPY_ESP_IDF_ENTRY(void) {
     
     xTaskCreatePinnedToCore(uart_handler_task, "uart_task", 
         4096, NULL, WATCHDOG_TASK_PRIORITY, NULL, 1);
+
+    xTaskCreatePinnedToCore(mp_user_code_guard_task, "mp_user_guard",
+        4096, NULL, WATCHDOG_TASK_PRIORITY, NULL, 1);
     
     // Create watchdog task
     // xTaskCreatePinnedToCore(watchdog_task, "watchdog_task", 
