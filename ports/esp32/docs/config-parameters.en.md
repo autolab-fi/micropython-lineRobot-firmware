@@ -20,16 +20,20 @@ This guide describes the coefficients and pins used by the robot firmware. Each 
 ## Speed limits
 - **maxs** — maximum allowed angular wheel speed, rad/s. Typical 10–20 rad/s. Used for controller saturation, limiting the commanded speed.
 - **ks** — straightness correction gain. Typical magnitude 50–150. Higher values more aggressively reduce speed mismatch between wheels when driving straight.
+- **msc** — maximum straight-line correction. Typical magnitude 10–40. Limits how strongly the slower wheel can be boosted from encoder mismatch.
+- **smi** — speed measurement interval in milliseconds. Typical magnitude 20–40 ms. Lower values react faster but are noisier; higher values are smoother but slower.
 
 ## PID for angle (distance/heading moves)
 - **kpa** — proportional gain for the angular controller. Magnitude 30–150. Higher values increase reaction to angle/distance error.
 - **kia** — integral gain for the angular controller. Magnitude 50–120. Speeds up removal of steady-state error but causes overshoot if too high.
 - **kda** — derivative gain for the angular controller. Magnitude 1–5. Dampens fast error changes.
+- **ila** — angle-controller integral limit. Typical magnitude 0.5–3.0. Prevents integral windup during long moves or wheel slip.
 
 ## PID for wheel speed
 - **kpsl / kpsr** — proportional gains for left/right wheel speed controllers. Typical magnitude 20–50. Define how strongly PWM reacts to mismatch between actual and target speed.
 - **kis** — integral gain for the speed controller (shared for both wheels). Magnitude 0–10. Removes long-term speed error.
 - **kdsl / kdsr** — derivative gains for the speed controllers. Magnitude 0–1. Help stabilize speed during quick load changes.
+- **ils** — speed-controller integral limit. Typical magnitude 2–6. Prevents the speed loop from accumulating excessive correction.
 
 ## Modes and debugging
 - **ks** — straight-line hold coefficient (duplicated from speed limits for convenience). Magnitude 50–150. Higher values give more aggressive drift compensation.
@@ -40,5 +44,6 @@ This guide describes the coefficients and pins used by the robot firmware. Each 
 2. Verify motor and encoder pins: adjust `pml*`, `pmr*`, `pel*`, `per*` to match your board if needed.
 3. Tune angle PID (`kpa`, `kia`, `kda`) for stable turns and accurate distance moves.
 4. Tune speed PID (`kpsl`, `kpsr`, `kis`, `kdsl`, `kdsr`) so wheels ramp smoothly without jerks.
-5. Adjust `ks` and `maxs` to balance straight-line stability and top speed.
-6. Add indication and telemetry via `pled*`, `pclk/psda`, `pbat`, `pch` if desired.
+5. Adjust `ks`, `msc`, and `smi` to balance straight-line stability, responsiveness, and encoder noise.
+6. Use `ila` and `ils` to limit integral windup if the robot overshoots after long moves or on low-friction surfaces.
+7. Add indication and telemetry via `pled*`, `pclk/psda`, `pbat`, `pch` if desired.

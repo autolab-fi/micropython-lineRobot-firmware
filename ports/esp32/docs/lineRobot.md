@@ -26,6 +26,7 @@ A MicroPython library for controlling differential drive robots with encoder fee
 - `encoder_degrees_left/right()` - Position in degrees
 - `encoder_radian_left/right()` - Position in radians
 - `get_speed_l/r()` - Wheel speed in rad/s
+- `get_speed_motors()` - Both wheel speeds in rad/s
 
 ---
 
@@ -52,6 +53,11 @@ The robot uses separate PID controllers for:
 - Speed control (maintaining target wheel speeds)
 - Angle control (precise distance/rotation movements)
 - Straight-line correction (preventing drift)
+
+Motion methods use encoders in different ways:
+- Distance and turn methods use encoder progress as the main stop condition.
+- Timed methods use elapsed time as the main stop condition and use encoders only for correction.
+- Manual speed control uses encoders for speed regulation only and does not stop automatically.
 
 ## Hardware Requirements
 
@@ -99,9 +105,19 @@ The robot loads configuration from `settings.json` or uses defaults:
   "kdsr": 0.1,                // Right speed PID - Derivative
   "kis": 0.0,                 // Speed PID - Integral
   "ks": 80.0,                 // Straight-line correction factor
-  "maxs": 15.0                // Maximum speed (rad/s)
+  "maxs": 15.0,               // Maximum speed (rad/s)
+  "ila": 1.5,                 // Angle PID integral limit
+  "ils": 4.0,                 // Speed PID integral limit
+  "msc": 25,                  // Maximum straight-line correction
+  "smi": 30                   // Speed measurement interval (ms)
 }
 ```
+
+### Accuracy-Related Parameters
+- `ila` - Limit for the angle-controller integral term. Lower values reduce overshoot, higher values help remove steady-state error.
+- `ils` - Limit for the speed-controller integral term. Lower values reduce windup, higher values help maintain speed under load.
+- `msc` - Maximum correction applied to the slower wheel during straight driving.
+- `smi` - Speed measurement interval in milliseconds used by `run_motors_speed()`. Lower values react faster but are noisier.
 
 ## Basic Usage
 
@@ -179,6 +195,13 @@ right_speed = robot.get_speed_r()
 - `move_forward_seconds(seconds)` - Move forward for specified time
 - `move_backward_seconds(seconds)` - Move backward for specified time
 
+#### Encoder Usage By Motion Method
+- `move_forward_distance()` / `move_backward_distance()` - encoder-based stop condition through the corresponding distance methods.
+- `move_forward_speed_distance()` / `move_backward_speed_distance()` - encoder-based stop condition with timeout fallback.
+- `turn_left_angle()` / `turn_right_angle()` / `turn_left()` / `turn_right()` / `rotate()` - encoder-based stop condition with timeout fallback.
+- `move_forward_seconds()` / `move_backward_seconds()` - time-based stop condition, encoder-based correction only.
+- `run_motors_speed()` - no built-in stop condition; the caller is responsible for stopping motion.
+
 ### Rotation Methods
 - `turn_left()` - Turn left 90 degrees
 - `turn_right()` - Turn right 90 degrees
@@ -210,6 +233,46 @@ right_speed = robot.get_speed_r()
 - `reset_regulators()` - Reset PID controller states
 - `constrain(value, min_val, max_val)` - Constrain value within range
 - `set_block_true()` - Enable blocking mode
+- `set_block_false()` - Disable blocking mode
+
+## Auto Calibration
+
+The firmware supports a conservative MQTT-triggered auto-calibration pass for straight driving.
+
+Current auto-calibration updates:
+- `ks` - straight-line correction gain
+- `msc` - maximum straight-line correction
+
+Current auto-calibration does not update:
+- angle PID gains (`kpa`, `kia`, `kda`)
+- speed PID gains (`kpsl`, `kpsr`, `kis`, `kdsl`, `kdsr`)
+- geometry values (`wrad`, `wdist`, `er`)
+
+### MQTT Command
+```json
+{
+  "command": "auto-calibrate"
+}
+```
+
+Optional explicit mode:
+```json
+{
+  "command": "auto-calibrate",
+  "mode": "straight"
+}
+```
+
+### What It Does
+- Runs several short straight passes.
+- Compares left and right encoder progress.
+- Updates `ks` and `msc` in `settings.json`.
+- Prints progress and final values to the normal Python output stream.
+
+### Safety Notes
+- Place the robot on a long straight surface with free space ahead.
+- The robot starts moving shortly after the command is accepted.
+- The routine is meant to improve straightness, not absolute distance accuracy in centimeters.
 
 ## Examples
 
