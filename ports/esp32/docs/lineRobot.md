@@ -269,10 +269,149 @@ Optional explicit mode:
 - Updates `ks` and `msc` in `settings.json`.
 - Prints progress and final values to the normal Python output stream.
 
+### Implementation Overview
+Current implementation is intentionally conservative and only calibrates straight driving.
+
+MQTT entry point:
+- `ports/esp32/mqtt_handler.c`
+- `auto-calibrate` queues Python code for `auto_calibrate_straight()` or `auto_calibrate_all()`
+- status is published to `topic_system/output`
+
+Calibration logic:
+- `ports/esp32/modules/calibration.py`
+- `_measure_straight_pass()` resets encoders and regulators, then drives both motors with the same speed for a short time window
+- `auto_calibrate_straight()` repeats the pass several times, averages encoder progress, computes mismatch, and updates settings
+
+Robot-side dependencies:
+- `ports/esp32/modules/lineRobot.py`
+- uses `reset_encoders()`, `reset_regulators()`, `run_motors_speed()`, `stop()`
+- reads encoder progress through `encoder_radian_left()` and `encoder_radian_right()`
+
+Persistence:
+- values are loaded from `settings.json`
+- updated values are written back to `settings.json`
+- `os.settings` is refreshed when available so the runtime sees the new values
+
+Decision logic for the current straight calibration:
+- if left/right mismatch is small, reduce correction slightly
+- if mismatch is moderate, increase `msc`
+- if mismatch is large, increase both `ks` and `msc`
+- `ks` and `msc` are bounded to avoid extreme jumps in one pass
+
+This design is meant to be safe enough for remote MQTT triggering. It does not try to solve all motion errors in one routine.
+
 ### Safety Notes
 - Place the robot on a long straight surface with free space ahead.
 - The robot starts moving shortly after the command is accepted.
 - The routine is meant to improve straightness, not absolute distance accuracy in centimeters.
+
+### Recommended Remote Workflow
+For remote calibration through MQTT:
+
+1. Read and save the current coefficients first.
+2. Run one calibration routine or one manual parameter change.
+3. Re-read the changed coefficients from MQTT.
+4. Run a verification movement such as a straight pass or square test.
+5. Keep a rollback file with `set-coeff` commands for the previous values.
+
+This is especially important because a failed motion test can be caused by instability or reboot, not only by bad coefficients.
+
+### How To Extend Auto Calibration
+The current straight routine is a good first step, but a complete system should calibrate in layers.
+
+Suggested order:
+1. Straightness calibration: update `ks` and `msc`
+2. Rotation calibration: update turn-related behavior before touching geometry
+3. Distance scaling calibration: update `wrad` or `er`
+4. Geometry calibration: update `wdist`
+5. Only after that, tune PID gains if tracking is still unstable
+
+#### 1. Straightness Calibration
+Use the existing implementation as the baseline:
+- run short forward passes
+- compare left and right encoder progress
+- update only correction terms, not geometry
+
+Reason:
+- straight mismatch is usually cheaper and safer to measure than full path geometry
+
+#### 2. Rotation Calibration
+Add a routine that performs repeated in-place turns, for example 90-degree right turns.
+
+Measure:
+- commanded angle versus observed angle
+- encoder-based wheel travel symmetry during turns
+- timeout frequency or controller saturation
+
+Typical outputs:
+- adjust a dedicated turn scaling constant if you add one
+- or adjust angle-controller parameters such as `kpa`, `kia`, `kda`
+
+Recommended implementation pattern:
+- create `_measure_turn_pass()` in `calibration.py`
+- log start and end heading for each pass
+- average several passes before applying any update
+- clamp parameter updates to small increments
+
+#### 3. Distance Scaling Calibration
+If the robot drives straight but overshoots or undershoots distance, calibrate wheel scale.
+
+Measure:
+- expected linear travel versus observed travel
+
+Typical outputs:
+- `wrad` if wheel radius in the model is wrong
+- `er` if encoder counts per revolution are effectively wrong
+
+Use this only after straightness is acceptable, otherwise lateral drift pollutes the measurement.
+
+#### 4. Geometry Calibration
+`wdist` affects turning geometry and should be calibrated only after turn execution is stable.
+
+Practical method:
+- run a square or repeated 90-degree turns
+- estimate heading error after each corner or after a full loop
+- if the robot consistently under-rotates, the model likely needs a different effective wheelbase
+- if it consistently over-rotates, adjust in the opposite direction
+
+Safe update strategy:
+- apply small percentage steps, for example 1 to 3 percent
+- verify with at least two loops before keeping the new value
+- do not combine `wdist` changes with PID changes in the same run
+
+#### 5. PID Gain Calibration
+PID tuning should be the last layer, because it is easy to mask wrong geometry with aggressive gains.
+
+Use PID calibration when:
+- turns finish but oscillate or overshoot
+- straight motion is noisy even with correct scale
+- controller response changes under battery sag or load
+
+Recommended approach:
+- keep one routine per subsystem
+- tune angle PID separately from speed PID
+- record timeout, overshoot, and settling behavior instead of changing gains from one sample
+
+### Suggested Code Structure For Future Work
+If auto calibration is expanded, keep the same pattern:
+
+- MQTT command in `mqtt_handler.c`
+- one Python entry point in `calibration.py`
+- one measurement helper per motion primitive
+- one pure decision block that converts measurements into bounded setting updates
+- one persistence step at the end
+
+That separation makes it much easier to test logic locally, replay measurements, and keep remote calibration safe.
+
+### Suggested Guardrails
+For future routines, add these protections:
+
+- stop immediately if encoder progress is too small
+- abort if battery status is below a safe threshold
+- abort on repeated timeout or reboot
+- print all measured values before writing settings
+- update only one parameter group per routine
+- never overwrite saved backup values automatically
 
 ## Examples
 
