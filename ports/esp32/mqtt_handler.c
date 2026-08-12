@@ -20,6 +20,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "esp_crt_bundle.h"
 #include "mqtt_client.h"
 #include "lwip/netdb.h"
 #include "lwip/inet.h"
@@ -273,6 +274,13 @@ static void log_broker_dns_resolution(void)
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
 
+static void configure_mqtt_tls(esp_mqtt_client_config_t *mqtt_cfg)
+{
+    if (strncmp(s_broker_uri, "mqtts://", 8) == 0) {
+        mqtt_cfg->broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
+    }
+}
+
 static void restart_mqtt_client(void)
 {
     if (mqtt_client) {
@@ -286,6 +294,7 @@ static void restart_mqtt_client(void)
     mqtt_cfg.credentials.username = s_mqtt_username;
     mqtt_cfg.credentials.authentication.password = s_mqtt_password;
     mqtt_cfg.credentials.client_id = s_client_id;
+    configure_mqtt_tls(&mqtt_cfg);
 
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     if (!mqtt_client) {
@@ -1323,6 +1332,7 @@ void mqtt_task(void *pvParameter) {
     mqtt_cfg.broker.address.uri = s_broker_uri;
     mqtt_cfg.credentials.username = s_mqtt_username;
     mqtt_cfg.credentials.authentication.password = s_mqtt_password;
+    configure_mqtt_tls(&mqtt_cfg);
     mqtt_cfg.credentials.client_id = s_client_id;
     
     char topic_system[MAX_STR_LEN];
