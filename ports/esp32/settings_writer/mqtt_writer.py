@@ -59,7 +59,11 @@ def connect_mqtt(broker_uri: str) -> mqtt.Client:
             host, port = rest.split(":")
         else:
             host, port = broker_uri.split(":")
-        client.username_pw_set("ondroid-iot", "pQT1#TCeeWulV2PL")
+        username = os.environ.get("MQTT_USERNAME")
+        password = os.environ.get("MQTT_PASSWORD")
+        if not username or not password:
+            raise RuntimeError("MQTT_USERNAME and MQTT_PASSWORD must be set")
+        client.username_pw_set(username, password)
         client.connect(host, int(port))
         client.loop_start()
         return client

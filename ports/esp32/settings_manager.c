@@ -48,10 +48,10 @@ esp_err_t settings_init(void) {
             return ESP_FAIL;
         }
         
-        cJSON_AddStringToObject(root, "broker_uri", "mqtt://138.68.88.247:1883");
+        cJSON_AddStringToObject(root, "broker_uri", "mqtt://mqtt.ondroid.org:1883");
         cJSON_AddStringToObject(root, "client_id", "lfmp1");
-        cJSON_AddStringToObject(root, "mqtt_username", "ondroid-iot");
-        cJSON_AddStringToObject(root, "mqtt_password", "pQT1#TCeeWulV2PL");
+        cJSON_AddStringToObject(root, "mqtt_username", "");
+        cJSON_AddStringToObject(root, "mqtt_password", "");
         cJSON_AddStringToObject(root, "wifi_pass", "12345678");
         cJSON_AddStringToObject(root, "wifi_ssid", "ssid");
         cJSON_AddStringToObject(root, "topic_system", "lfmp_init/system");
