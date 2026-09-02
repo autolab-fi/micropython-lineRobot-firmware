@@ -125,6 +125,8 @@ class Robot:
         self.target_angle = 0
         self.left_motor_signal = 0
         self.right_motor_signal = 0
+        self.current_speed_left = 0.0
+        self.current_speed_right = 0.0
         self.STANDARD_SPEED_PERCENTAGE = 65
         self.STANDARD_SPEED_PERCENTAGE_SLOW = 50
         
@@ -213,6 +215,8 @@ class Robot:
         self.stop_motor_right()
         self.left_motor_signal = 0
         self.right_motor_signal = 0
+        self.current_speed_left = 0.0
+        self.current_speed_right = 0.0
         self.reset_regulators()
         if reset_encoders:
             self.reset_encoders()
@@ -331,6 +335,8 @@ class Robot:
         
         
         cur_speed_l, cur_speed_r = self.get_speed_motors(self.speed_measure_interval_ms)
+        self.current_speed_left = cur_speed_l
+        self.current_speed_right = cur_speed_r
 
         target_speed_l = speed_left * self.k_speed_radians
         target_speed_r = speed_right * self.k_speed_radians
