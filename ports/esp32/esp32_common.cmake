@@ -140,6 +140,7 @@ list(APPEND MICROPY_SOURCE_PORT
     machine_sdcard.c
     modespnow.c
     mqtt_handler.c
+    coefficient_validation.c
     uart_handler.c
     settings_manager.c
     cJSON.c

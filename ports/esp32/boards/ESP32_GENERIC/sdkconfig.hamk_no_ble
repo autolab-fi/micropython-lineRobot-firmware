@@ -1,0 +1,5 @@
+# The HAMK line robot communicates over Wi-Fi/MQTT and does not use Bluetooth.
+# Disabling the unused stack keeps the application inside the 1.5 MiB OTA slot.
+CONFIG_BT_ENABLED=n
+CONFIG_BT_CONTROLLER_ENABLED=n
+CONFIG_BT_NIMBLE_ENABLED=n

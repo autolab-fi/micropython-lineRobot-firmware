@@ -1,5 +1,6 @@
 #include "mqtt_handler.h"
 #include "settings_manager.h"
+#include "coefficient_validation.h"
 #include "uart_handler.h"
 #include "esp_http_client.h"
 #include "esp_ota_ops.h"
@@ -523,36 +524,32 @@ static void process_system_input_message(esp_mqtt_client_handle_t client, const 
             cJSON *type_f = cJSON_GetObjectItemCaseSensitive(json, "type");
             char response[128];
 
-            if (cJSON_IsString(name_f) && (name_f->valuestring != NULL) && cJSON_IsString(type_f) && (type_f->valuestring != NULL)) {
-                char *name = strdup(name_f->valuestring);
-                char *type = strdup(type_f->valuestring);
+            if (cJSON_IsString(name_f) && (name_f->valuestring != NULL) &&
+                cJSON_IsString(type_f) && (type_f->valuestring != NULL) && cJSON_IsNumber(value_f)) {
+                const char *name = name_f->valuestring;
+                const char *type = type_f->valuestring;
+                const coefficient_spec_t *spec = find_coefficient_spec(name);
+                double value = value_f->valuedouble;
 
-                if (strcmp(type, "float") == 0 && cJSON_IsNumber(value_f)) {
-                    float value = value_f->valuedouble;
-                    set_setting(name, cJSON_CreateNumber(value));
+                if (!validate_coefficient_value(spec, type, value)) {
+                    ESP_LOGE(TAG, "Rejected coefficient %s type=%s value=%f", name, type, value);
+                    snprintf(response, sizeof(response),
+                             "{\"status\":\"error\",\"msg\":\"Invalid coefficient, type, or range\"}");
+                } else if (set_setting(name, cJSON_CreateNumber(value)) == ESP_OK) {
+                    // The C settings store is canonical. Queue a copy into the
+                    // MicroPython filesystem for the next Robot instance.
+                    write_settings_to_micropython();
                     ESP_LOGI(TAG, "Set %s to %f", name, value);
-                    snprintf(response, sizeof(response), "{\"msg\":\"Set %s to %f\"}", name, value);
-                }
-                else if (cJSON_IsString(value_f) && (value_f->valuestring != NULL) && strcmp(type, "string") == 0) {
-                    char *value = value_f->valuestring;
-                    set_setting(name, cJSON_CreateString(value));
-                    ESP_LOGI(TAG, "Set %s to %s", name, value);
-                    snprintf(response, sizeof(response), "{\"msg\":\"Set %s to %s\"}", name, value);
-                }
-                else if (cJSON_IsNumber(value_f) && strcmp(type, "int") == 0) {
-                    int value = value_f->valueint;
-                    set_setting(name, cJSON_CreateNumber(value));
-                    ESP_LOGI(TAG, "Set %s to %d", name, value);
-                    snprintf(response, sizeof(response), "{\"msg\":\"Set %s to %d\"}", name, value);
+                    snprintf(response, sizeof(response),
+                             "{\"status\":\"success\",\"msg\":\"Set %s to %.6f\"}", name, value);
                 } else {
-                    ESP_LOGE(TAG, "Invalid value type");
-                    snprintf(response, sizeof(response), "{\"msg\":\"Invalid value type\"}");
+                    ESP_LOGE(TAG, "Failed to persist coefficient %s", name);
+                    snprintf(response, sizeof(response),
+                             "{\"status\":\"error\",\"msg\":\"Failed to persist coefficient\"}");
                 }
-
-                free(name);
-                free(type);
             } else {
-                snprintf(response, sizeof(response), "{\"msg\":\"error\"}");
+                snprintf(response, sizeof(response),
+                         "{\"status\":\"error\",\"msg\":\"Invalid set-coeff request\"}");
             }
             esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
         } else if (strcmp(command->valuestring, "get-coeff") == 0) {
@@ -560,34 +557,25 @@ static void process_system_input_message(esp_mqtt_client_handle_t client, const 
             cJSON *name_f = cJSON_GetObjectItemCaseSensitive(json, "name");
             char response[128];
             if (cJSON_IsString(name_f) && (name_f->valuestring != NULL) && cJSON_IsString(type_f) && (type_f->valuestring != NULL)) {
-                char *name = strdup(name_f->valuestring);
-                char *type = strdup(type_f->valuestring);
-                if (strcmp(type, "float") == 0) {
+                const char *name = name_f->valuestring;
+                const char *type = type_f->valuestring;
+                const coefficient_spec_t *spec = find_coefficient_spec(name);
+                if (spec != NULL && spec->type == COEFFICIENT_FLOAT && strcmp(type, "float") == 0) {
                     float value = get_float_setting(name, -1.0f);
                     ESP_LOGI(TAG, "Value of %s: %f\n", name, value);
                     snprintf(response, sizeof(response), "{\"msg\":\"Value of %s: %f\"}", name, value);
                 }
-                else if (strcmp(type, "string") == 0) {
-                    char value[MAX_STR_LEN];
-                    if (get_string_setting(name, value, sizeof(value)) == ESP_OK) {
-                        ESP_LOGI(TAG, "Value of %s: %s\n", name, value);
-                        snprintf(response, sizeof(response), "{\"msg\":\"Value of %s: %s\"}", name, value);
-                    } else {
-                        ESP_LOGE(TAG, "Failed to get string setting %s", name);
-                        snprintf(response, sizeof(response), "{\"msg\":\"Failed to get string setting %s\"}", name);
-                    }
-                }
-                else if (strcmp(type, "int") == 0) {
+                else if (spec != NULL && spec->type == COEFFICIENT_INT && strcmp(type, "int") == 0) {
                     int value = get_int_setting(name, -1);
                     ESP_LOGI(TAG, "Value of %s: %d\n", name, value);
                     snprintf(response, sizeof(response), "{\"msg\":\"Value of %s: %d\"}", name, value);
                 } else {
-                    snprintf(response, sizeof(response), "{\"msg\":\"Invalid value type\"}");
+                    snprintf(response, sizeof(response),
+                             "{\"status\":\"error\",\"msg\":\"Invalid coefficient or type\"}");
                 }
-                free(name);
-                free(type);
             } else {
-                snprintf(response, sizeof(response), "{\"msg\":\"error\"}");
+                snprintf(response, sizeof(response),
+                         "{\"status\":\"error\",\"msg\":\"Invalid get-coeff request\"}");
             }
             esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
         }

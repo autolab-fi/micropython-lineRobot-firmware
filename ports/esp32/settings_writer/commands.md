@@ -33,24 +33,14 @@ STOP
   "type": "float"
 }
 
-{
-  "command": "get-coeff",
-  "name": "broker_uri",
-  "type": "string"
-}
+`get-coeff` and `set-coeff` accept only allowlisted numeric robot
+coefficients. Connectivity credentials are not exposed through these commands.
 
 {
   "command": "set-coeff",
   "name": "ks",
   "type": "float",
   "value": 80.0
-}
-
-{
-  "command": "set-coeff",
-  "name": "wifi_pass",
-  "type": "string",
-  "value": "password"
 }
 
 {

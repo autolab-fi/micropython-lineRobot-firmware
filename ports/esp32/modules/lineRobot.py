@@ -207,14 +207,15 @@ class Robot:
         self.in3.duty(0)
         self.in4.duty(0)
     
-    def stop(self):
-        """Stop both motors"""
+    def stop(self, reset_encoders=True):
+        """Stop both motors, optionally preserving encoder positions."""
         self.stop_motor_left()
         self.stop_motor_right()
         self.left_motor_signal = 0
         self.right_motor_signal = 0
         self.reset_regulators()
-        self.reset_encoders()
+        if reset_encoders:
+            self.reset_encoders()
         if self.debug:
             print("Robot stopped")
         time.sleep_ms(30)

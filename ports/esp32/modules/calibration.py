@@ -1,33 +1,10 @@
-import os
 import time
 import ujson
 
+from calibration_math import summarize_straight_passes
 from lineRobot import Robot
 
-SETTINGS_FILE = "settings.json"
-
-
-def _load_settings():
-    if SETTINGS_FILE in os.listdir():
-        with open(SETTINGS_FILE, "r") as f:
-            return ujson.load(f)
-    return {}
-
-
-def _save_settings(settings):
-    with open(SETTINGS_FILE, "w") as f:
-        ujson.dump(settings, f)
-    if hasattr(os, "settings"):
-        os.settings.update(settings)
-
-
-def _update_settings(updates):
-    settings = _load_settings()
-    settings.update(updates)
-    _save_settings(settings)
-
-
-def _measure_straight_pass(robot, speed=35, duration_ms=1200):
+def _measure_straight_pass(robot, speed=20, duration_ms=600):
     robot.reset_encoders()
     robot.reset_regulators()
     start_time = time.ticks_ms()
@@ -36,74 +13,65 @@ def _measure_straight_pass(robot, speed=35, duration_ms=1200):
         while time.ticks_diff(time.ticks_ms(), start_time) < duration_ms:
             robot.run_motors_speed(speed, speed)
     finally:
-        robot.stop()
+        # Preserve encoder values until the measurement has been captured.
+        robot.stop(reset_encoders=False)
 
     left_progress = abs(robot.encoder_radian_left())
     right_progress = abs(robot.encoder_radian_right())
+    robot.reset_encoders()
     return left_progress, right_progress
 
 
-def auto_calibrate_straight(speed=35, duration_ms=1200, passes=3):
-    robot = Robot()
-    total_left = 0.0
-    total_right = 0.0
+def auto_calibrate_straight(speed=20, duration_ms=600, passes=3):
+    if speed < 10 or speed > 60:
+        raise ValueError("Calibration speed must be between 10 and 60 percent")
+    if duration_ms < 300 or duration_ms > 5000:
+        raise ValueError("Calibration duration must be between 300 and 5000 ms")
+    if passes < 1 or passes > 10:
+        raise ValueError("Calibration passes must be between 1 and 10")
 
-    print("Auto-calibration: straight-line encoder balancing started")
-    print("Place robot on a long straight surface with free space ahead")
-    time.sleep_ms(1500)
+    try:
+        robot = Robot()
+        measurements = []
 
-    for idx in range(passes):
-        left_progress, right_progress = _measure_straight_pass(robot, speed=speed, duration_ms=duration_ms)
-        total_left += left_progress
-        total_right += right_progress
-        print(
-            "Pass {}: left={:.3f} rad right={:.3f} rad".format(
-                idx + 1, left_progress, right_progress
+        print("Calibration measurement: straight-line encoder pass started")
+        print("Place robot on a long straight surface with free space ahead")
+        time.sleep_ms(1500)
+
+        for idx in range(passes):
+            left_progress, right_progress = _measure_straight_pass(robot, speed=speed, duration_ms=duration_ms)
+            measurements.append((left_progress, right_progress))
+            print(
+                "Pass {}: left={:.3f} rad right={:.3f} rad".format(
+                    idx + 1, left_progress, right_progress
+                )
             )
-        )
-        time.sleep_ms(700)
+            time.sleep_ms(700)
 
-    avg_left = total_left / passes if passes else 0.0
-    avg_right = total_right / passes if passes else 0.0
-    if avg_left <= 0.01 or avg_right <= 0.01:
-        raise ValueError("Calibration failed: encoder progress too small")
+        result = summarize_straight_passes(measurements)
+        result.update({
+            "status": "measured",
+            "mode": "straight",
+            "measurement_only": True,
+            "speed_percent": speed,
+            "duration_ms": duration_ms,
+        })
 
-    base_settings = _load_settings()
-    current_ks = float(base_settings.get("ks", 80.0))
-    current_msc = int(base_settings.get("msc", 25))
-    mismatch_ratio = abs(avg_left - avg_right) / max(avg_left, avg_right)
-
-    proposed_ks = current_ks
-    if mismatch_ratio < 0.03:
-        proposed_ks = max(30.0, current_ks * 0.95)
-    elif mismatch_ratio > 0.12:
-        proposed_ks = min(140.0, current_ks * 1.15)
-
-    proposed_msc = current_msc
-    if mismatch_ratio < 0.03:
-        proposed_msc = max(10, current_msc - 2)
-    elif mismatch_ratio > 0.12:
-        proposed_msc = min(45, current_msc + 4)
-    elif mismatch_ratio > 0.06:
-        proposed_msc = min(40, current_msc + 2)
-
-    _update_settings({
-        "ks": round(proposed_ks, 2),
-        "msc": int(proposed_msc),
-    })
-
-    print("Auto-calibration finished")
-    print("Average left={:.3f} rad right={:.3f} rad mismatch={:.2%}".format(avg_left, avg_right, mismatch_ratio))
-    print("Updated ks={} msc={}".format(round(proposed_ks, 2), int(proposed_msc)))
-
-    return {
-        "avg_left": avg_left,
-        "avg_right": avg_right,
-        "mismatch_ratio": mismatch_ratio,
-        "ks": round(proposed_ks, 2),
-        "msc": int(proposed_msc),
-    }
+        print("Calibration measurement finished; settings were not changed")
+        print("CALIBRATION_RESULT " + ujson.dumps(result))
+        return result
+    except Exception as exc:
+        result = {
+            "status": "error",
+            "mode": "straight",
+            "measurement_only": True,
+            "message": str(exc),
+        }
+        print("CALIBRATION_RESULT " + ujson.dumps(result))
+        raise
 
 
 def auto_calibrate_all():
+    # Kept as a compatibility alias until turn and square measurements are
+    # orchestrated by the camera-aware worker.
     return auto_calibrate_straight()

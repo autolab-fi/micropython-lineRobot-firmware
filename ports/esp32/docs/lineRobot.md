@@ -235,18 +235,11 @@ right_speed = robot.get_speed_r()
 - `set_block_true()` - Enable blocking mode
 - `set_block_false()` - Disable blocking mode
 
-## Auto Calibration
+## Calibration Measurement
 
-The firmware supports a conservative MQTT-triggered auto-calibration pass for straight driving.
-
-Current auto-calibration updates:
-- `ks` - straight-line correction gain
-- `msc` - maximum straight-line correction
-
-Current auto-calibration does not update:
-- angle PID gains (`kpa`, `kia`, `kda`)
-- speed PID gains (`kpsl`, `kpsr`, `kis`, `kdsl`, `kdsr`)
-- geometry values (`wrad`, `wdist`, `er`)
+The firmware supports an MQTT-triggered, measurement-only encoder balance pass.
+It deliberately does not update any setting. Encoder agreement is not external
+ground truth and cannot identify wheel radius, wheelbase, slip, or path error.
 
 ### MQTT Command
 ```json
@@ -265,12 +258,15 @@ Optional explicit mode:
 
 ### What It Does
 - Runs several short straight passes.
+- Uses three 600 ms passes at 20% speed by default; callers may request other
+  values within the validation limits when invoking the Python API directly.
 - Compares left and right encoder progress.
-- Updates `ks` and `msc` in `settings.json`.
-- Prints progress and final values to the normal Python output stream.
+- Preserves encoder positions until each measurement has been captured.
+- Prints a machine-readable `CALIBRATION_RESULT {json}` line.
+- Leaves every coefficient unchanged.
 
 ### Implementation Overview
-Current implementation is intentionally conservative and only calibrates straight driving.
+Current implementation intentionally measures only straight driving.
 
 MQTT entry point:
 - `ports/esp32/mqtt_handler.c`
@@ -280,39 +276,35 @@ MQTT entry point:
 Calibration logic:
 - `ports/esp32/modules/calibration.py`
 - `_measure_straight_pass()` resets encoders and regulators, then drives both motors with the same speed for a short time window
-- `auto_calibrate_straight()` repeats the pass several times, averages encoder progress, computes mismatch, and updates settings
+- `auto_calibrate_straight()` repeats the pass, averages encoder progress, and reports signed and absolute mismatch
+- `calibration_math.py` contains the hardware-independent calculation used by host tests
 
 Robot-side dependencies:
 - `ports/esp32/modules/lineRobot.py`
-- uses `reset_encoders()`, `reset_regulators()`, `run_motors_speed()`, `stop()`
+- uses `reset_encoders()`, `reset_regulators()`, `run_motors_speed()`, and `stop(reset_encoders=False)`
 - reads encoder progress through `encoder_radian_left()` and `encoder_radian_right()`
 
 Persistence:
-- values are loaded from `settings.json`
-- updated values are written back to `settings.json`
-- `os.settings` is refreshed when available so the runtime sees the new values
-
-Decision logic for the current straight calibration:
-- if left/right mismatch is small, reduce correction slightly
-- if mismatch is moderate, increase `msc`
-- if mismatch is large, increase both `ks` and `msc`
-- `ks` and `msc` are bounded to avoid extreme jumps in one pass
-
-This design is meant to be safe enough for remote MQTT triggering. It does not try to solve all motion errors in one routine.
+- measurement does not write settings
+- `set-coeff` writes the canonical SPIFFS settings and queues a synchronized
+  copy for the MicroPython filesystem
+- coefficient names, types, and ranges are validated before persistence
 
 ### Safety Notes
 - Place the robot on a long straight surface with free space ahead.
 - The robot starts moving shortly after the command is accepted.
-- The routine is meant to improve straightness, not absolute distance accuracy in centimeters.
+- Run it only with explicit operator approval and exclusive access to the arena.
+- The result describes encoder balance, not physical straightness or distance accuracy.
 
 ### Recommended Remote Workflow
 For remote calibration through MQTT:
 
-1. Read and save the current coefficients first.
-2. Run one calibration routine or one manual parameter change.
-3. Re-read the changed coefficients from MQTT.
-4. Run a verification movement such as a straight pass or square test.
-5. Keep a rollback file with `set-coeff` commands for the previous values.
+1. Confirm that the arena is clear and no student workflow is active.
+2. Read and save the current coefficients.
+3. Run the measurement and capture `CALIBRATION_RESULT`.
+4. Combine encoder data with camera position and heading measurements.
+5. Review a bounded recommendation before issuing `set-coeff`.
+6. Run a straight, turn, and square verification before keeping the change.
 
 This is especially important because a failed motion test can be caused by instability or reboot, not only by bad coefficients.
 
@@ -330,7 +322,8 @@ Suggested order:
 Use the existing implementation as the baseline:
 - run short forward passes
 - compare left and right encoder progress
-- update only correction terms, not geometry
+- combine the encoder result with camera lateral and heading error
+- produce a recommendation without applying it
 
 Reason:
 - straight mismatch is usually cheaper and safer to measure than full path geometry
@@ -348,8 +341,8 @@ Typical outputs:
 - or adjust angle-controller parameters such as `kpa`, `kia`, `kda`
 
 Recommended implementation pattern:
-- create `_measure_turn_pass()` in `calibration.py`
-- log start and end heading for each pass
+- execute bounded turn primitives on the robot
+- log start and end camera heading in the worker
 - average several passes before applying any update
 - clamp parameter updates to small increments
 
@@ -398,8 +391,8 @@ If auto calibration is expanded, keep the same pattern:
 - MQTT command in `mqtt_handler.c`
 - one Python entry point in `calibration.py`
 - one measurement helper per motion primitive
-- one pure decision block that converts measurements into bounded setting updates
-- one persistence step at the end
+- camera analysis and bounded recommendations in the worker
+- one validated `set-coeff` persistence path after operator approval
 
 That separation makes it much easier to test logic locally, replay measurements, and keep remote calibration safe.
 
