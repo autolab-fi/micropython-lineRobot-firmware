@@ -44,6 +44,7 @@
 #include "mqtt_handler.h"
 #include "uart_handler.h"
 #include "micropython_task.h"
+#include "status_led.h"
 //#include "wifi_handler.h"
 // #include "watchdog_handler.h"
 
@@ -147,6 +148,11 @@ void MICROPY_ESP_IDF_ENTRY(void) {
 
     xTaskCreatePinnedToCore(mp_user_code_guard_task, "mp_user_guard",
         4096, NULL, WATCHDOG_TASK_PRIORITY, NULL, 1);
+
+    #if MICROPY_HW_HAMK_OTA
+    xTaskCreatePinnedToCore(status_led_task, "status_led",
+        2048, NULL, MP_TASK_PRIORITY, NULL, 1);
+    #endif
     
     // Create watchdog task
     // xTaskCreatePinnedToCore(watchdog_task, "watchdog_task", 

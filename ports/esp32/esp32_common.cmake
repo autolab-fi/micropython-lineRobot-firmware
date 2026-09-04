@@ -143,6 +143,7 @@ list(APPEND MICROPY_SOURCE_PORT
     coefficient_validation.c
     uart_handler.c
     settings_manager.c
+    status_led.c
     cJSON.c
     cJSON_Utils.c
     micropython_task.c

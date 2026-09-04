@@ -35,6 +35,7 @@
 #include "modnetwork.h"
 #include "settings_manager.h"
 #include "mqtt_handler.h"
+#include "status_led.h"
 
 #if MICROPY_BLUETOOTH_NIMBLE
 #include "extmod/modbluetooth.h"
@@ -255,6 +256,7 @@ soft_reset:
         
         // Check for new Python code to execute
         if (xQueueReceive(python_code_queue, &received_code, pdMS_TO_TICKS(10)) == pdTRUE) {
+            status_led_begin_user_code();
             py_code = received_code;
         }
         
@@ -336,6 +338,7 @@ soft_reset_exit:
     machine_pwm_deinit_all();
     // TODO: machine_rmt_deinit_all();
     machine_pins_deinit();
+    status_led_end_user_code();
     machine_deinit();
     #if MICROPY_PY_SOCKET_EVENTS
     socket_events_deinit();

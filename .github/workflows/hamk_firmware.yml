@@ -1,0 +1,99 @@
+name: HAMK signed firmware
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - '.github/workflows/hamk_firmware.yml'
+      - 'tools/**'
+      - 'py/**'
+      - 'extmod/**'
+      - 'shared/**'
+      - 'lib/**'
+      - 'drivers/**'
+      - 'ports/esp32/**'
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: hamk-firmware-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-sign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: idf_ver
+        name: Read ESP-IDF version
+        run: source tools/ci.sh && echo "IDF_VER=${IDF_VER}-py${PYTHON_VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache ESP-IDF
+        id: cache_esp_idf
+        uses: actions/cache@v4
+        with:
+          path: |
+            ./esp-idf/
+            ~/.espressif/
+            !~/.espressif/dist/
+            ~/.cache/pip/
+          key: esp-idf-${{ steps.idf_ver.outputs.IDF_VER }}
+
+      - name: Install ESP-IDF packages
+        if: steps.cache_esp_idf.outputs.cache-hit != 'true'
+        run: source tools/ci.sh && ci_esp32_idf_setup
+
+      - name: Configure submodules
+        run: |
+          source esp-idf/export.sh
+          make -C ports/esp32 BOARD=ESP32_GENERIC BOARD_VARIANT=HAMK_OTA submodules
+
+      - name: Build and verify Bluetooth-free HAMK firmware
+        run: |
+          source esp-idf/export.sh
+          tools/build-hamk-firmware.sh -j2
+
+      - name: Create immutable firmware package
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          mkdir -p dist
+          cp ports/esp32/build-ESP32_GENERIC-HAMK_OTA/micropython.bin "dist/hamk-ota-${SOURCE_REVISION}.bin"
+          cp ports/esp32/build-ESP32_GENERIC-HAMK_OTA/firmware.bin "dist/hamk-full-${SOURCE_REVISION}.bin"
+          cd dist
+          sha256sum "hamk-ota-${SOURCE_REVISION}.bin" "hamk-full-${SOURCE_REVISION}.bin" > SHA256SUMS
+          ota_sha256=$(sha256sum "hamk-ota-${SOURCE_REVISION}.bin" | cut -d ' ' -f 1)
+          full_sha256=$(sha256sum "hamk-full-${SOURCE_REVISION}.bin" | cut -d ' ' -f 1)
+          ota_size=$(wc -c < "hamk-ota-${SOURCE_REVISION}.bin")
+          full_size=$(wc -c < "hamk-full-${SOURCE_REVISION}.bin")
+          jq -n \
+            --arg source_revision "$SOURCE_REVISION" \
+            --arg variant "HAMK_OTA" \
+            --argjson bluetooth false \
+            --arg ota_file "hamk-ota-${SOURCE_REVISION}.bin" \
+            --arg ota_sha256 "$ota_sha256" \
+            --argjson ota_size "$ota_size" \
+            --arg full_file "hamk-full-${SOURCE_REVISION}.bin" \
+            --arg full_sha256 "$full_sha256" \
+            --argjson full_size "$full_size" \
+            '{source_revision: $source_revision, firmware_variant: $variant, bluetooth: $bluetooth, artifacts: [{file: $ota_file, purpose: "ota", sha256: $ota_sha256, size: $ota_size}, {file: $full_file, purpose: "serial-recovery", sha256: $full_sha256, size: $full_size}]}' \
+            > manifest.json
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Sign firmware manifest
+        run: cosign sign-blob --yes --bundle dist/manifest.sigstore.json dist/manifest.json
+
+      - name: Upload firmware package
+        uses: actions/upload-artifact@v4
+        with:
+          name: hamk-firmware-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30

@@ -2,6 +2,7 @@
 #include "settings_manager.h"
 #include "coefficient_validation.h"
 #include "uart_handler.h"
+#include "status_led.h"
 #include "esp_http_client.h"
 #include "esp_ota_ops.h"
 #include "esp_task_wdt.h"
@@ -28,6 +29,23 @@
 #include "driver/uart.h"
 #include "modmachine.h"
 #include "cJSON.h"
+#include "genhdr/mpversion.h"
+
+#ifndef MICROPY_HW_HAMK_OTA
+#define MICROPY_HW_HAMK_OTA (0)
+#endif
+
+#if MICROPY_HW_HAMK_OTA
+#define FIRMWARE_VARIANT "HAMK_OTA"
+#else
+#define FIRMWARE_VARIANT "generic"
+#endif
+
+#if MICROPY_PY_BLUETOOTH
+#define FIRMWARE_BLUETOOTH_JSON "true"
+#else
+#define FIRMWARE_BLUETOOTH_JSON "false"
+#endif
 
 // Recovery configuration
 #define WIFI_RECONNECT_BACKOFF_STEPS           5
@@ -40,6 +58,7 @@
 #define MQTT_STABLE_CONNECTED_MS                30000
 #define ENABLE_OFFLINE_FALLBACK_RESTART        1
 #define WIFI_INITIAL_CONNECT_WAIT_MS            15000
+#define OTA_HEALTH_TIMEOUT_MS                   (3 * 60 * 1000)
 
 // WiFi event bits
 #define WIFI_CONNECTED_BIT BIT0
@@ -318,6 +337,80 @@ extern void set_measure_adc_flag(bool value);
 // OTA status variables
 static bool ota_in_progress = false;
 static int ota_progress = 0;
+static bool ota_pending_verification = false;
+static bool ota_battery_status_seen = false;
+static uint64_t ota_pending_since_ms = 0;
+
+static void stop_motors_for_reset(void);
+
+static bool charging_value_is_active(const cJSON *charging)
+{
+    if (cJSON_IsTrue(charging)) {
+        return true;
+    }
+    if (cJSON_IsNumber(charging)) {
+        return charging->valuedouble >= 10.0;
+    }
+    if (cJSON_IsString(charging) && charging->valuestring != NULL) {
+        return strcmp(charging->valuestring, "true") == 0
+            || strcmp(charging->valuestring, "1") == 0
+            || atof(charging->valuestring) >= 10.0;
+    }
+    return false;
+}
+
+static void note_system_telemetry(const char *payload)
+{
+    cJSON *json = cJSON_Parse(payload);
+    if (json == NULL) {
+        return;
+    }
+
+    cJSON *voltage = cJSON_GetObjectItemCaseSensitive(json, "voltage");
+    cJSON *charging = cJSON_GetObjectItemCaseSensitive(json, "charging");
+    if (cJSON_IsNumber(voltage) && charging != NULL) {
+        ota_battery_status_seen = true;
+        status_led_set_charging(charging_value_is_active(charging));
+    }
+    cJSON_Delete(json);
+}
+
+static void ota_health_check_tick(void)
+{
+    if (!ota_pending_verification) {
+        return;
+    }
+
+    uint64_t now_ms = monotonic_ms();
+    bool mqtt_stable = s_recovery.wifi_connected
+        && s_recovery.mqtt_connected
+        && s_recovery.mqtt_connected_since_ms > 0
+        && now_ms - s_recovery.mqtt_connected_since_ms >= MQTT_STABLE_CONNECTED_MS;
+
+    if (mqtt_stable && ota_battery_status_seen) {
+        esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+        if (err == ESP_OK) {
+            ota_pending_verification = false;
+            esp_mqtt_client_publish(
+                mqtt_client,
+                MQTT_SYSTEM_OUTPUT_TOPIC,
+                "{\"status\":\"ota_valid\",\"health\":\"wifi_mqtt_battery\"}",
+                0, 1, 0
+            );
+            ESP_LOGI(TAG, "OTA image validated after WiFi, MQTT and battery health checks");
+        } else {
+            ESP_LOGE(TAG, "Failed to mark healthy OTA image valid: %s", esp_err_to_name(err));
+        }
+        return;
+    }
+
+    if (now_ms - ota_pending_since_ms >= OTA_HEALTH_TIMEOUT_MS) {
+        ESP_LOGE(TAG, "OTA health check timed out; rebooting to trigger rollback");
+        status_led_suspend();
+        stop_motors_for_reset();
+        esp_restart();
+    }
+}
 
 // Watchdog variables
 #define WDT_TIMEOUT_SEC 20  // 20 seconds watchdog timeout
@@ -656,6 +749,7 @@ static void process_system_input_message(esp_mqtt_client_handle_t client, const 
         else if (strcmp(command->valuestring, "mark-valid") == 0) {
             esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
             if (err == ESP_OK) {
+                ota_pending_verification = false;
                 esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC,
                                        "{\"status\":\"success\",\"message\":\"Firmware marked as valid\"}", 0, 1, 0);
                 ESP_LOGI(TAG, "Firmware marked as valid");
@@ -795,20 +889,16 @@ static void perform_ota_update(const char *url)
     ota_in_progress = true;
     ESP_LOGI(TAG, "Starting OTA update from URL: %s", url);
 
-    // Check and fix OTA state before starting
+    // Never replace an image which is still being health-checked. Doing so
+    // would remove the known-good rollback target.
     const esp_partition_t *running = esp_ota_get_running_partition();
     esp_ota_img_states_t ota_state;
     if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
         if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
-            ESP_LOGI(TAG, "Current firmware in pending verify state, marking as valid");
-            esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "Failed to mark current firmware as valid: %s", esp_err_to_name(err));
-                esp_mqtt_client_publish(mqtt_client, MQTT_SYSTEM_OUTPUT_TOPIC, 
-                                       "{\"status\":\"ota_failed\",\"error\":\"cannot_validate_current_firmware\"}", 0, 1, 0);
-                goto ota_end;
-            }
-            ESP_LOGI(TAG, "Current firmware marked as valid, proceeding with OTA");
+            ESP_LOGE(TAG, "Refusing OTA while current image is pending health verification");
+            esp_mqtt_client_publish(mqtt_client, MQTT_SYSTEM_OUTPUT_TOPIC,
+                                   "{\"status\":\"ota_failed\",\"error\":\"current_image_pending_verification\"}", 0, 1, 0);
+            goto ota_end;
         }
     }
 
@@ -975,6 +1065,7 @@ static void perform_ota_update(const char *url)
 
     if (ota_success) {
         // Publish success and restart
+        status_led_suspend();
         esp_mqtt_client_publish(mqtt_client, MQTT_SYSTEM_OUTPUT_TOPIC, 
                                "{\"status\":\"ota_success\",\"restarting\":true}", 0, 1, 0);
         vTaskDelay(pdMS_TO_TICKS(2000)); // Wait for message to be sent
@@ -1089,10 +1180,18 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         // Subscribe to topic
         msg_id = esp_mqtt_client_subscribe(client, MQTT_SYSTEM_INPUT_TOPIC, 1);
         ESP_LOGI(TAG, "sent subscribe to command topic, msg_id=%d", msg_id);
+
+        // Request a fresh battery/charger sample. It drives the status LED and
+        // is also one of the OTA health signals.
+        set_measure_adc_flag(true);
         
         // Publish status
-        char response[64];
-        snprintf(response, sizeof(response), "{\"type\":\"hello\", \"msg\":\"calib-fw 07.04.2026\"}");
+        char response[256];
+        snprintf(response, sizeof(response),
+                 "{\"type\":\"hello\",\"msg\":\"HAMK line robot firmware\","
+                 "\"firmware_revision\":\"%s\",\"firmware_variant\":\"%s\","
+                 "\"bluetooth\":%s,\"calibration_protocol\":1}",
+                 MICROPY_GIT_HASH, FIRMWARE_VARIANT, FIRMWARE_BLUETOOTH_JSON);
         msg_id = esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
         ESP_LOGI(TAG, "sent status publish, msg_id=%d", msg_id);
         break;
@@ -1293,18 +1392,16 @@ void mqtt_task(void *pvParameter) {
     const esp_partition_t *running = esp_ota_get_running_partition();
     ESP_LOGI(TAG, "Running partition: %s at 0x%lx", running->label, running->address);
 
-    // Check OTA state and mark as valid if needed
+    // A newly booted OTA image remains rollback-capable until its external
+    // communication and battery telemetry have proven healthy.
     esp_ota_img_states_t ota_state;
     if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
         ESP_LOGI(TAG, "Current OTA state: %d", ota_state);
         if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
-            ESP_LOGI(TAG, "Pending verification detected, marking current firmware as valid");
-            esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
-            if (err == ESP_OK) {
-                ESP_LOGI(TAG, "Current firmware marked as valid");
-            } else {
-                ESP_LOGE(TAG, "Failed to mark firmware as valid: %s", esp_err_to_name(err));
-            }
+            ota_pending_verification = true;
+            ota_battery_status_seen = false;
+            ota_pending_since_ms = monotonic_ms();
+            ESP_LOGI(TAG, "Pending OTA image: waiting for WiFi, MQTT and battery health checks");
         }
     }
     
@@ -1348,6 +1445,7 @@ void mqtt_task(void *pvParameter) {
         TickType_t now = xTaskGetTickCount();
         recovery_reset_if_stable();
         log_recovery_timers(now);
+        ota_health_check_tick();
 
         if (!s_recovery.wifi_connected && now >= s_recovery.next_wifi_reconnect_tick) {
             recovery_note_degradation(1);
@@ -1417,6 +1515,7 @@ void mqtt_task(void *pvParameter) {
             char bat[received_len - 3 + 1]; // +1 для '\0'
             strncpy(bat, buffer + 3, received_len - 3);
             bat[received_len - 3] = '\0'; // Явно добавляем нуль-терминатор
+            note_system_telemetry(bat);
             
             printf("%s\n", bat);
             esp_mqtt_client_publish(
