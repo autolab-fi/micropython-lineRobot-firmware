@@ -15,6 +15,12 @@ int main(void) {
     assert(!validate_coefficient_value(encoder, "int", 2376.5));
     assert(!validate_coefficient_value(encoder, "float", 2376));
 
+    const coefficient_spec_t *right_forward = find_coefficient_spec("ffr_fwd");
+    assert(validate_coefficient_value(right_forward, "int", 16));
+    assert(validate_coefficient_value(right_forward, "int", 0));
+    assert(!validate_coefficient_value(right_forward, "int", 251));
+    assert(!validate_coefficient_value(right_forward, "float", 16));
+
     assert(find_coefficient_spec("wifi_pass") == NULL);
     assert(!validate_coefficient_value(NULL, "float", 1));
     assert(!validate_coefficient_value(wrad, "float", NAN));

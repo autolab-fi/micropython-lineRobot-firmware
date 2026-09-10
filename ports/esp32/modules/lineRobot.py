@@ -57,7 +57,11 @@ class Robot:
             "ila": 1.5,
             "ils": 4.0,
             "msc": 25,
-            "smi": 30
+            "smi": 30,
+            "ffl_fwd": 0,
+            "ffl_rev": 0,
+            "ffr_fwd": 0,
+            "ffr_rev": 0
         }
         try:
             #print("loading params from the memory")
@@ -95,6 +99,12 @@ class Robot:
         self.integral_limit_speed = config["ils"]
         self.max_straight_correction = config["msc"]
         self.speed_measure_interval_ms = config["smi"]
+        # Direction-specific static-friction compensation in native PWM units.
+        # Defaults are zero so existing robots keep identical motion after OTA.
+        self.feedforward_left_forward = self.constrain(int(config["ffl_fwd"]), 0, 250)
+        self.feedforward_left_reverse = self.constrain(int(config["ffl_rev"]), 0, 250)
+        self.feedforward_right_forward = self.constrain(int(config["ffr_fwd"]), 0, 250)
+        self.feedforward_right_reverse = self.constrain(int(config["ffr_rev"]), 0, 250)
         self.time_to_msg = time.ticks_ms()
     
     def _init_hardware(self, config):
@@ -355,9 +365,35 @@ class Robot:
             self.compute_pid_speed_motor(err_r, self.kp_speed_right, self.kd_speed_right, 
                                        self.ki_speed, self.integral_speed_right, 
                                        self.previous_err_speed_right, self.last_time_right_speed)
+
+        self.left_motor_signal = self._apply_directional_feedforward(
+            self.left_motor_signal,
+            speed_left,
+            self.feedforward_left_forward,
+            self.feedforward_left_reverse,
+        )
+        self.right_motor_signal = self._apply_directional_feedforward(
+            self.right_motor_signal,
+            speed_right,
+            self.feedforward_right_forward,
+            self.feedforward_right_reverse,
+        )
         
         self.run_motor_left(self.left_motor_signal)
         self.run_motor_right(self.right_motor_signal)
+
+    def _apply_directional_feedforward(self, signal, requested_speed, forward, reverse):
+        """Add bounded static-friction PWM without weakening PID braking.
+
+        Compensation follows the requested direction only while the PID output
+        is driving in that same direction.  If PID reverses its output to brake
+        an overshoot, no feed-forward is added against the braking command.
+        """
+        if requested_speed > 0 and signal >= 0:
+            signal += forward
+        elif requested_speed < 0 and signal <= 0:
+            signal -= reverse
+        return self.constrain(signal, -1000, 1000)
     
     def reset_regulators(self):
         """Reset PID controllers"""

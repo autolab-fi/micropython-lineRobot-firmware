@@ -14,6 +14,8 @@ static const coefficient_spec_t COEFFICIENT_SPECS[] = {
     {"pbat", COEFFICIENT_INT, 0, 39}, {"pch", COEFFICIENT_INT, 0, 39},
     {"debug", COEFFICIENT_INT, 0, 1}, {"smi", COEFFICIENT_INT, 5, 1000},
     {"msc", COEFFICIENT_INT, 0, 100}, {"er", COEFFICIENT_INT, 100, 10000},
+    {"ffl_fwd", COEFFICIENT_INT, 0, 250}, {"ffl_rev", COEFFICIENT_INT, 0, 250},
+    {"ffr_fwd", COEFFICIENT_INT, 0, 250}, {"ffr_rev", COEFFICIENT_INT, 0, 250},
     {"wrad", COEFFICIENT_FLOAT, 1, 10}, {"wdist", COEFFICIENT_FLOAT, 5, 50},
     {"maxs", COEFFICIENT_FLOAT, 1, 30}, {"kpa", COEFFICIENT_FLOAT, 0, 300},
     {"kia", COEFFICIENT_FLOAT, 0, 300}, {"kda", COEFFICIENT_FLOAT, 0, 50},
