@@ -38,6 +38,9 @@ void  execute_python_code(const char* code);
 // User-code execution guard helpers
 void mp_user_code_guard_task(void *pvParameter);
 bool mp_user_code_is_active(void);
+bool mp_network_maintenance_begin(void);
+void mp_network_maintenance_end(void);
+bool mp_network_maintenance_active(void);
 uint32_t mp_user_code_get_execution_id(void);
 TickType_t mp_user_code_get_deadline(void);
 bool mp_user_code_timeout_handled(void);

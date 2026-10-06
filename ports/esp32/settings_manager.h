@@ -17,6 +17,8 @@ float get_float_setting(const char *key, float default_value);
 
 // Write function
 esp_err_t set_setting(const char *key, cJSON *value);
+// Persist both Wi-Fi fields together in one NVS value after a successful trial.
+esp_err_t set_wifi_settings(const char *ssid, const char *password);
 
 // Utility functions
 void print_all_settings(void);

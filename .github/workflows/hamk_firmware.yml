@@ -56,6 +56,7 @@ jobs:
       - name: Build and verify Bluetooth-free HAMK firmware
         run: |
           source esp-idf/export.sh
+          tools/test-wifi-switch.sh
           tools/build-hamk-firmware.sh -j2
 
       - name: Create immutable firmware package

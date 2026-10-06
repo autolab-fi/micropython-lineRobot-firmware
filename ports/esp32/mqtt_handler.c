@@ -1,5 +1,7 @@
 #include "mqtt_handler.h"
 #include "settings_manager.h"
+#include "wifi_switch.h"
+#include "micropython_task.h"
 #include "coefficient_validation.h"
 #include "uart_handler.h"
 #include "status_led.h"
@@ -343,6 +345,196 @@ static uint64_t ota_pending_since_ms = 0;
 
 static void stop_motors_for_reset(void);
 
+typedef struct {
+    enum { WIFI_CMD_STATUS, WIFI_CMD_CONFIGURE, WIFI_CMD_CONFIRM, WIFI_CMD_CANCEL } kind;
+    char id[49];
+    char ssid[33];
+    char password[65];
+} wifi_command_t;
+
+static QueueHandle_t wifi_command_queue;
+// Only mqtt_task owns these values; the MQTT callback sends commands via queue.
+static wifi_switch_t wifi_switch_state;
+static wifi_config_t wifi_previous_config;
+static bool wifi_status_was_connected;
+
+static void publish_wifi_status(const char *error) {
+    cJSON *status = cJSON_CreateObject();
+    if (!status) {
+        return;
+    }
+    cJSON_AddStringToObject(status, "type", "wifi-status");
+    cJSON_AddStringToObject(status, "state", wifi_switch_phase_name(wifi_switch_state.phase));
+    cJSON_AddStringToObject(status, "request_id", wifi_switch_state.request_id);
+    cJSON_AddStringToObject(status, "target_ssid", wifi_switch_state.ssid);
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        cJSON_AddStringToObject(status, "ssid", (const char *)ap.ssid);
+        cJSON_AddNumberToObject(status, "rssi", ap.rssi);
+    }
+    esp_netif_ip_info_t ip;
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif && esp_netif_get_ip_info(netif, &ip) == ESP_OK) {
+        char address[16];
+        snprintf(address, sizeof(address), IPSTR, IP2STR(&ip.ip));
+        cJSON_AddStringToObject(status, "ip", address);
+    }
+    uint64_t elapsed = monotonic_ms() - wifi_switch_state.started_ms;
+    cJSON_AddNumberToObject(status, "remaining_ms", wifi_switch_active(&wifi_switch_state)
+        && elapsed < WIFI_SWITCH_TIMEOUT_MS ? WIFI_SWITCH_TIMEOUT_MS - elapsed : 0);
+    if (error) {
+        cJSON_AddStringToObject(status, "error", error);
+    }
+    char *payload = cJSON_PrintUnformatted(status);
+    if (payload) {
+        esp_mqtt_client_enqueue(mqtt_client, MQTT_SYSTEM_OUTPUT_TOPIC, payload, 0, 1, 0, true);
+        free(payload);
+    }
+    cJSON_Delete(status);
+}
+
+static void queue_wifi_command(esp_mqtt_client_handle_t client, const cJSON *json, const char *name) {
+    wifi_command_t command = {0};
+    bool valid = true;
+    if (strcmp(name, "wifi-status") == 0) {
+        command.kind = WIFI_CMD_STATUS;
+    } else {
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(json, "request_id");
+        valid = cJSON_IsString(id) && id->valuestring[0] && strlen(id->valuestring) < sizeof(command.id);
+        if (valid) {
+            strcpy(command.id, id->valuestring);
+        }
+        if (strcmp(name, "wifi-configure") == 0) {
+            command.kind = WIFI_CMD_CONFIGURE;
+            const cJSON *ssid = cJSON_GetObjectItemCaseSensitive(json, "ssid");
+            const cJSON *password = cJSON_GetObjectItemCaseSensitive(json, "password");
+            valid = valid && cJSON_IsString(ssid) && cJSON_IsString(password)
+                && wifi_credentials_valid(ssid->valuestring, password->valuestring);
+            if (valid) {
+                strcpy(command.ssid, ssid->valuestring);
+                strcpy(command.password, password->valuestring);
+            }
+        } else if (strcmp(name, "wifi-confirm") == 0) {
+            command.kind = WIFI_CMD_CONFIRM;
+        } else if (strcmp(name, "wifi-cancel") == 0) {
+            command.kind = WIFI_CMD_CANCEL;
+        } else {
+            valid = false;
+        }
+    }
+    if (!valid || !wifi_command_queue || xQueueSend(wifi_command_queue, &command, 0) != pdTRUE) {
+        esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC,
+            "{\"type\":\"wifi-status\",\"error\":\"invalid_request_or_queue_full\"}", 0, 1, 0);
+    }
+    memset(&command, 0, sizeof(command));
+}
+
+static bool wifi_trial_connected(void) {
+    wifi_ap_record_t ap;
+    return s_recovery.wifi_connected && s_recovery.mqtt_connected
+        && esp_wifi_sta_get_ap_info(&ap) == ESP_OK
+        && strcmp((const char *)ap.ssid, wifi_switch_state.ssid) == 0;
+}
+
+static esp_err_t apply_wifi_config(wifi_config_t *config) {
+    // Outside the MQTT callback: stop waits for callbacks to finish. Trial
+    // credentials live in driver RAM only, so a reboot uses the confirmed pair.
+    esp_mqtt_client_stop(mqtt_client);
+    s_recovery.mqtt_connected = false;
+    s_recovery.wifi_connected = false;
+    s_recovery.mqtt_connected_since_ms = 0;
+    esp_err_t err = esp_wifi_stop();
+    if (err == ESP_OK) {
+        err = esp_wifi_set_config(WIFI_IF_STA, config);
+    }
+    if (err == ESP_OK) {
+        err = esp_wifi_start();
+    }
+    esp_mqtt_client_start(mqtt_client);
+    return err;
+}
+
+static void rollback_wifi_switch(void) {
+    esp_err_t err = ESP_OK;
+    if (wifi_switch_state.phase != WIFI_SWITCH_PENDING) {
+        err = apply_wifi_config(&wifi_previous_config);
+    }
+    wifi_switch_finish(&wifi_switch_state, err == ESP_OK ? WIFI_SWITCH_ROLLED_BACK : WIFI_SWITCH_FAILED);
+    memset(&wifi_previous_config, 0, sizeof(wifi_previous_config));
+    publish_wifi_status(err == ESP_OK ? NULL : "rollback_failed_rebooting");
+    if (err != ESP_OK) {
+        // Confirmed persistent settings have not changed.
+        esp_restart();
+    }
+    mp_network_maintenance_end();
+}
+
+static void wifi_switch_tick(void) {
+    uint64_t now = monotonic_ms();
+    wifi_switch_action_t action = wifi_switch_poll(&wifi_switch_state, now, wifi_trial_connected());
+    if (action == WIFI_SWITCH_APPLY) {
+        wifi_config_t config = {0};
+        memcpy(config.sta.ssid, wifi_switch_state.ssid, strlen(wifi_switch_state.ssid));
+        memcpy(config.sta.password, wifi_switch_state.password, strlen(wifi_switch_state.password));
+        config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+        if (apply_wifi_config(&config) != ESP_OK) {
+            rollback_wifi_switch();
+        }
+        memset(&config, 0, sizeof(config));
+    } else if (action == WIFI_SWITCH_ROLLBACK) {
+        rollback_wifi_switch();
+    } else if (action == WIFI_SWITCH_NOTIFY_READY) {
+        publish_wifi_status(NULL);
+    }
+    if (s_recovery.mqtt_connected && !wifi_status_was_connected) {
+        publish_wifi_status(NULL);
+    }
+    wifi_status_was_connected = s_recovery.mqtt_connected;
+
+    wifi_command_t command;
+    if (!wifi_command_queue || xQueueReceive(wifi_command_queue, &command, 0) != pdTRUE) {
+        return;
+    }
+    if (command.kind == WIFI_CMD_STATUS) {
+        publish_wifi_status(NULL);
+    } else if (command.kind == WIFI_CMD_CONFIGURE) {
+        if (strcmp(command.id, wifi_switch_state.request_id) == 0) {
+            publish_wifi_status(NULL);
+        } else if (wifi_switch_active(&wifi_switch_state) || ota_in_progress || ota_pending_verification
+            || !s_recovery.mqtt_connected || !s_recovery.wifi_connected
+            || !mp_network_maintenance_begin()) {
+            publish_wifi_status("busy");
+        } else if (esp_wifi_get_config(WIFI_IF_STA, &wifi_previous_config) != ESP_OK
+            || !wifi_switch_begin(&wifi_switch_state, command.id, command.ssid, command.password, now)) {
+            mp_network_maintenance_end();
+            publish_wifi_status("cannot_start");
+        } else {
+            publish_wifi_status(NULL);
+        }
+    } else if (command.kind == WIFI_CMD_CONFIRM) {
+        if (wifi_switch_state.phase == WIFI_SWITCH_COMMITTED
+            && strcmp(command.id, wifi_switch_state.request_id) == 0) {
+            publish_wifi_status(NULL);
+        } else if (!wifi_switch_can_confirm(&wifi_switch_state, command.id, now, wifi_trial_connected())) {
+            publish_wifi_status("not_ready_or_request_mismatch");
+        } else if (set_wifi_settings(wifi_switch_state.ssid, wifi_switch_state.password) != ESP_OK) {
+            rollback_wifi_switch();
+            publish_wifi_status("persist_failed");
+        } else {
+            wifi_switch_finish(&wifi_switch_state, WIFI_SWITCH_COMMITTED);
+            memset(&wifi_previous_config, 0, sizeof(wifi_previous_config));
+            mp_network_maintenance_end();
+            publish_wifi_status(NULL);
+        }
+    } else if (wifi_switch_active(&wifi_switch_state)
+        && strcmp(command.id, wifi_switch_state.request_id) == 0) {
+        rollback_wifi_switch();
+    } else {
+        publish_wifi_status("no_matching_trial");
+    }
+    memset(&command, 0, sizeof(command));
+}
+
 static bool charging_value_is_active(const cJSON *charging)
 {
     if (cJSON_IsTrue(charging)) {
@@ -552,16 +744,20 @@ static void process_system_input_message(esp_mqtt_client_handle_t client, const 
 
     cJSON *json = cJSON_ParseWithLength(data, data_len);
     if (json == NULL) {
-        const char *error_ptr = cJSON_GetErrorPtr();
-        if (error_ptr != NULL) {
-            ESP_LOGE(TAG, "JSON parse error before: %s", error_ptr);
-        }
+        ESP_LOGE(TAG, "Invalid system command JSON");
         return;
     }
 
     cJSON *command = cJSON_GetObjectItemCaseSensitive(json, "command");
     if (cJSON_IsString(command) && (command->valuestring != NULL)) {
-        if (strcmp(command->valuestring, "ping") == 0) {
+        if (strncmp(command->valuestring, "wifi-", 5) == 0) {
+            queue_wifi_command(client, json, command->valuestring);
+        } else if (mp_network_maintenance_active()
+            && strcmp(command->valuestring, "ping") != 0
+            && strcmp(command->valuestring, "battery-status") != 0) {
+            esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC,
+                "{\"status\":\"error\",\"message\":\"WiFi maintenance in progress\"}", 0, 1, 0);
+        } else if (strcmp(command->valuestring, "ping") == 0) {
             char response[64];
             snprintf(response, sizeof(response), "{\"msg\":\"pong\"}");
             esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
@@ -589,6 +785,14 @@ static void process_system_input_message(esp_mqtt_client_handle_t client, const 
                 if (cJSON_IsString(url) && (url->valuestring != NULL)) {
                     char *url_copy = strdup(url->valuestring);
                     if (url_copy != NULL) {
+                        if (!mp_network_maintenance_begin()) {
+                            free(url_copy);
+                            esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC,
+                                "{\"status\":\"error\",\"message\":\"Device busy\"}", 0, 1, 0);
+                            cJSON_Delete(json);
+                            return;
+                        }
+                        ota_in_progress = true;
                         BaseType_t result = xTaskCreate(
                             ota_task,
                             "ota_task",
@@ -600,6 +804,8 @@ static void process_system_input_message(esp_mqtt_client_handle_t client, const 
                         if (result == pdPASS) {
                             ESP_LOGI(TAG, "OTA update task created for URL: %s", url_copy);
                         } else {
+                            ota_in_progress = false;
+                            mp_network_maintenance_end();
                             ESP_LOGE(TAG, "Failed to create OTA task");
                             free(url_copy);
                             esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC,
@@ -778,7 +984,7 @@ static void process_incoming_mqtt_message(esp_mqtt_client_handle_t client, const
     }
 
     printf("TOPIC=%.*s\r\n", topic_len, topic);
-    printf("DATA=%.*s\r\n", data_len, data);
+    // System commands may contain WiFi credentials. Never log raw payloads.
 
     if (topic_matches(topic, topic_len, MQTT_SYSTEM_INPUT_TOPIC)) {
         process_system_input_message(client, data, data_len);
@@ -881,12 +1087,7 @@ static esp_err_t ota_http_event_handler(esp_http_client_event_t *evt)
 // Improved OTA update function with retry logic and state validation
 static void perform_ota_update(const char *url)
 {
-    if (ota_in_progress) {
-        ESP_LOGE(TAG, "OTA update already in progress");
-        return;
-    }
-
-    ota_in_progress = true;
+    // The input handler reserves maintenance and OTA ownership before spawning.
     ESP_LOGI(TAG, "Starting OTA update from URL: %s", url);
 
     // Never replace an image which is still being health-checked. Doing so
@@ -1079,6 +1280,7 @@ static void perform_ota_update(const char *url)
 
 ota_end:
     ota_in_progress = false;
+    mp_network_maintenance_end();
 }
 
 // OTA task wrapper
@@ -1190,7 +1392,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         snprintf(response, sizeof(response),
                  "{\"type\":\"hello\",\"msg\":\"HAMK line robot firmware\","
                  "\"firmware_revision\":\"%s\",\"firmware_variant\":\"%s\","
-                 "\"bluetooth\":%s,\"calibration_protocol\":1}",
+                 "\"bluetooth\":%s,\"calibration_protocol\":1,\"wifi_protocol\":1}",
                  MICROPY_GIT_HASH, FIRMWARE_VARIANT, FIRMWARE_BLUETOOTH_JSON);
         msg_id = esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
         ESP_LOGI(TAG, "sent status publish, msg_id=%d", msg_id);
@@ -1219,6 +1421,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         
     case MQTT_EVENT_DATA: {
         ESP_LOGI(TAG, "MQTT_EVENT_DATA");
+        if (event->retain) {
+            ESP_LOGW(TAG, "Ignoring retained command");
+            break;
+        }
 
         partial_message_t *partial = find_partial_message(event->msg_id, event->topic, event->topic_len);
         const char *topic_ptr = event->topic;
@@ -1332,6 +1538,7 @@ static void wifi_init_sta()
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
 
     esp_event_handler_instance_t instance_any_id;
     esp_event_handler_instance_t instance_got_ip;
@@ -1346,11 +1553,11 @@ static void wifi_init_sta()
                     NULL,
                     &instance_got_ip));
 
-    char wssid[MAX_STR_LEN];
-    char wpass[MAX_STR_LEN];
+    char wssid[33] = {0};
+    char wpass[65] = {0};
     
-    get_string_setting("wifi_ssid", wssid, sizeof(wssid));
-    get_string_setting("wifi_pass", wpass, sizeof(wpass));
+    ESP_ERROR_CHECK(get_string_setting("wifi_ssid", wssid, sizeof(wssid)));
+    ESP_ERROR_CHECK(get_string_setting("wifi_pass", wpass, sizeof(wpass)));
 
     wifi_config_t wifi_config = {
        .sta = {
@@ -1378,11 +1585,11 @@ static void wifi_init_sta()
                                            pdMS_TO_TICKS(WIFI_INITIAL_CONNECT_WAIT_MS));
 
     if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
-                 wssid, wpass);
+        ESP_LOGI(TAG, "connected to configured WiFi");
     } else {
         ESP_LOGW(TAG, "Initial WiFi connect timed out after %d ms; continuing with recovery loop", WIFI_INITIAL_CONNECT_WAIT_MS);
     }
+    memset(wpass, 0, sizeof(wpass));
 }
 
 // MQTT task running on core 1
@@ -1405,6 +1612,7 @@ void mqtt_task(void *pvParameter) {
         }
     }
     
+    wifi_command_queue = xQueueCreate(4, sizeof(wifi_command_t));
     // Initialize WiFi
     wifi_init_sta();
     
@@ -1446,6 +1654,7 @@ void mqtt_task(void *pvParameter) {
         recovery_reset_if_stable();
         log_recovery_timers(now);
         ota_health_check_tick();
+        wifi_switch_tick();
 
         if (!s_recovery.wifi_connected && now >= s_recovery.next_wifi_reconnect_tick) {
             recovery_note_degradation(1);

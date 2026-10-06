@@ -1,4 +1,7 @@
 #include "settings_manager.h"
+#include "wifi_switch.h"
+#include "micropython_task.h"
+#include "nvs.h"
 #include "esp_log.h"
 #include "esp_spiffs.h"
 #include "freertos/FreeRTOS.h"
@@ -9,6 +12,48 @@
 
 static const char *TAG = "settings";
 static SemaphoreHandle_t settings_mutex = NULL;
+
+typedef struct {
+    char ssid[33];
+    char password[65];
+} wifi_credentials_t;
+
+static esp_err_t read_wifi_credentials(wifi_credentials_t *credentials) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("robot_network", NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+    size_t length = sizeof(*credentials);
+    err = nvs_get_blob(handle, "wifi_v1", credentials, &length);
+    nvs_close(handle);
+    if (err == ESP_OK && (length != sizeof(*credentials)
+        || !memchr(credentials->ssid, 0, sizeof(credentials->ssid))
+        || !memchr(credentials->password, 0, sizeof(credentials->password)))) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    return err;
+}
+
+esp_err_t set_wifi_settings(const char *ssid, const char *password) {
+    if (!wifi_credentials_valid(ssid, password)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    wifi_credentials_t credentials = {0};
+    strcpy(credentials.ssid, ssid);
+    strcpy(credentials.password, password);
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("robot_network", NVS_READWRITE, &handle);
+    if (err == ESP_OK) {
+        err = nvs_set_blob(handle, "wifi_v1", &credentials, sizeof(credentials));
+        if (err == ESP_OK) {
+            err = nvs_commit(handle);
+        }
+        nvs_close(handle);
+    }
+    memset(&credentials, 0, sizeof(credentials));
+    return err;
+}
 
 // Forward declarations
 static cJSON* read_settings_file(void);
@@ -117,9 +162,28 @@ static cJSON* read_settings_file(void) {
     
     cJSON *json = cJSON_Parse(json_str);
     if (json == NULL) {
-        const char *error_ptr = cJSON_GetErrorPtr();
-        ESP_LOGE(TAG, "JSON parse error: %s", error_ptr ? error_ptr : "unknown");
+        ESP_LOGE(TAG, "Settings JSON parse error");
     }
+
+    // NVS is authoritative after remote provisioning. Legacy installations keep
+    // using SPIFFS until their first confirmed switch. Overlay for UART reads,
+    // coefficient updates and the MicroPython settings mirror as well.
+    wifi_credentials_t credentials = {0};
+    esp_err_t wifi_err = read_wifi_credentials(&credentials);
+    if (json && wifi_err == ESP_OK) {
+        cJSON_DeleteItemFromObject(json, "wifi_ssid");
+        cJSON_DeleteItemFromObject(json, "wifi_pass");
+        if (!cJSON_AddStringToObject(json, "wifi_ssid", credentials.ssid)
+            || !cJSON_AddStringToObject(json, "wifi_pass", credentials.password)) {
+            cJSON_Delete(json);
+            json = NULL;
+        }
+    } else if (wifi_err != ESP_OK && wifi_err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGE(TAG, "Cannot read WiFi credentials: %s", esp_err_to_name(wifi_err));
+        cJSON_Delete(json);
+        json = NULL;
+    }
+    memset(&credentials, 0, sizeof(credentials));
     
     free(json_str);
     return json;
@@ -172,6 +236,27 @@ esp_err_t set_setting(const char *key, cJSON *value) {
         return ESP_FAIL;
     }
     
+    // Keep the serial provisioning commands consistent with the NVS pair.
+    if (strcmp(key, "wifi_ssid") == 0 || strcmp(key, "wifi_pass") == 0) {
+        if (!mp_network_maintenance_begin()) {
+            cJSON_Delete(value);
+            return ESP_ERR_INVALID_STATE;
+        }
+        char ssid[33] = {0};
+        char password[65] = {0};
+        esp_err_t err = ESP_ERR_INVALID_ARG;
+        if (cJSON_IsString(value)
+            && get_string_setting("wifi_ssid", ssid, sizeof(ssid)) == ESP_OK
+            && get_string_setting("wifi_pass", password, sizeof(password)) == ESP_OK) {
+            err = set_wifi_settings(strcmp(key, "wifi_ssid") == 0 ? value->valuestring : ssid,
+                strcmp(key, "wifi_pass") == 0 ? value->valuestring : password);
+        }
+        memset(password, 0, sizeof(password));
+        cJSON_Delete(value);
+        mp_network_maintenance_end();
+        return err;
+    }
+
     cJSON *root = read_settings_file();
     if (root == NULL) {
         ESP_LOGE(TAG, "Failed to read settings file");
@@ -283,6 +368,10 @@ void print_all_settings(void) {
     cJSON *item = NULL;
     cJSON_ArrayForEach(item, root) {
         if (item->string == NULL) continue;
+        if (strcmp(item->string, "wifi_pass") == 0 || strcmp(item->string, "mqtt_password") == 0) {
+            ESP_LOGI(TAG, "%-20s = [redacted]", item->string);
+            continue;
+        }
         
         if (cJSON_IsString(item)) {
             ESP_LOGI(TAG, "%-20s = \"%s\" (string)", item->string, item->valuestring);

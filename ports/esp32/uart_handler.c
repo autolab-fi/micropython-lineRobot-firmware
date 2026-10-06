@@ -64,7 +64,8 @@ esp_err_t uart_handler_init(void) {
 }
 
 void process_uart_command(const char* command) {
-    ESP_LOGI(TAG, "Processing UART command: %s", command);
+    // Configuration commands can contain passwords.
+    ESP_LOGD(TAG, "Processing UART command");
     
     // Check for help command
     if (strcmp(command, "help;") == 0) {
@@ -122,8 +123,8 @@ void process_uart_command(const char* command) {
                 }
             }
             else if (strcmp(type, "string") == 0) {
-                set_setting(name, cJSON_CreateString(value));
-                printf("Set %s (string) to %s\n", name, value);
+                esp_err_t err = set_setting(name, cJSON_CreateString(value));
+                printf("Set %s: %s\n", name, esp_err_to_name(err));
             }
             else {
                 printf("Unknown type: %s\n", type);

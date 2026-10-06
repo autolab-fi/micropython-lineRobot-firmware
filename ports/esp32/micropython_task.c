@@ -68,6 +68,9 @@ static bool measure_adc = false;
 static char* py_code = "";
 
 static volatile bool user_code_active = false;
+// Cover boot scripts and peripheral cleanup, not only the timed Python body.
+static bool user_code_reserved = true;
+static bool network_maintenance = false;
 static volatile bool user_code_timeout_handled = false;
 static volatile uint32_t user_code_execution_id = 0;
 static volatile TickType_t user_code_deadline = 0;
@@ -78,14 +81,43 @@ typedef struct {
     const char *code;   // указатель на строку Python-кода
 } py_string_arg_t;
 
-static inline void mp_user_code_begin_execution(void) {
+bool mp_network_maintenance_begin(void) {
     mp_uint_t atomic_state = MICROPY_BEGIN_ATOMIC_SECTION();
+    bool available = !user_code_reserved && !network_maintenance;
+    if (available) {
+        network_maintenance = true;
+    }
+    MICROPY_END_ATOMIC_SECTION(atomic_state);
+    return available;
+}
+
+void mp_network_maintenance_end(void) {
+    mp_uint_t atomic_state = MICROPY_BEGIN_ATOMIC_SECTION();
+    network_maintenance = false;
+    MICROPY_END_ATOMIC_SECTION(atomic_state);
+}
+
+bool mp_network_maintenance_active(void) {
+    mp_uint_t atomic_state = MICROPY_BEGIN_ATOMIC_SECTION();
+    bool active = network_maintenance;
+    MICROPY_END_ATOMIC_SECTION(atomic_state);
+    return active;
+}
+
+static inline bool mp_user_code_begin_execution(void) {
+    mp_uint_t atomic_state = MICROPY_BEGIN_ATOMIC_SECTION();
+    if (network_maintenance) {
+        MICROPY_END_ATOMIC_SECTION(atomic_state);
+        return false;
+    }
+    user_code_reserved = true;
     user_code_execution_id += 1;
     user_code_active = true;
     user_code_timeout_handled = false;
     user_code_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(USER_CODE_TIMEOUT_MS);
     user_code_interrupt_deadline = 0;
     MICROPY_END_ATOMIC_SECTION(atomic_state);
+    return true;
 }
 
 static inline void mp_user_code_finish_execution(void) {
@@ -246,6 +278,9 @@ soft_reset:
     }
 
     char* received_code = NULL;
+    mp_uint_t atomic_state = MICROPY_BEGIN_ATOMIC_SECTION();
+    user_code_reserved = false;
+    MICROPY_END_ATOMIC_SECTION(atomic_state);
 
     for (;;) {
         // Check ADC measurement flag
@@ -256,16 +291,24 @@ soft_reset:
         
         // Check for new Python code to execute
         if (xQueueReceive(python_code_queue, &received_code, pdMS_TO_TICKS(10)) == pdTRUE) {
+            if (!received_code || !*received_code) {
+                free(received_code);
+                received_code = NULL;
+                continue;
+            }
+            while (!mp_user_code_begin_execution()) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
             status_led_begin_user_code();
             py_code = received_code;
         }
         
         // Execute Python code if available
         if (strlen(py_code) > 0) {
-            printf("Executing Python code: %s\n", py_code);
+            // The startup settings mirror contains credentials.
+            printf("Executing Python code (%u bytes)\n", (unsigned)strlen(py_code));
             py_string_arg_t codic = {py_code};
             py_string_arg_t *arg = &codic;
-            mp_user_code_begin_execution();
             ESP_LOGI(TAG, "User code execution started, timeout armed for %d ms", USER_CODE_TIMEOUT_MS);
 
             nlr_buf_t nlr;
