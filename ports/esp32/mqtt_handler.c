@@ -10,6 +10,8 @@
 #include "esp_task_wdt.h"
 #include "esp_partition.h"
 #include "esp_timer.h"
+#include "esp_random.h"
+#include "esp_attr.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -48,6 +50,21 @@
 #else
 #define FIRMWARE_BLUETOOTH_JSON "false"
 #endif
+
+// A boot epoch fences delayed commands; RTC memory carries a Stop receipt across
+// software reset only. MQTT reconnects preserve the epoch and cannot fake reboot.
+static char control_boot_id[17];
+static RTC_NOINIT_ATTR char control_stop_receipt[65];
+static RTC_NOINIT_ATTR uint32_t control_receipt_magic;
+static void control_boot_init(void) {
+    snprintf(control_boot_id, sizeof(control_boot_id), "%08lx%08lx",
+        (unsigned long)esp_random(), (unsigned long)esp_random());
+    if (esp_reset_reason() != ESP_RST_SW || control_receipt_magic != 0x53544f50) {
+        control_stop_receipt[0] = 0;
+    }
+    control_stop_receipt[64] = 0;
+    control_receipt_magic = 0;
+}
 
 // Recovery configuration
 #define WIFI_RECONNECT_BACKOFF_STEPS           5
@@ -748,6 +765,12 @@ static void process_system_input_message(esp_mqtt_client_handle_t client, const 
         return;
     }
 
+    cJSON *expected_boot = cJSON_GetObjectItemCaseSensitive(json, "expected_boot_id");
+    if (expected_boot && (!cJSON_IsString(expected_boot) ||
+            strcmp(expected_boot->valuestring, control_boot_id) != 0)) {
+        cJSON_Delete(json);
+        return;  // stale command from an execution before the last restart
+    }
     cJSON *command = cJSON_GetObjectItemCaseSensitive(json, "command");
     if (cJSON_IsString(command) && (command->valuestring != NULL)) {
         if (strncmp(command->valuestring, "wifi-", 5) == 0) {
@@ -758,8 +781,8 @@ static void process_system_input_message(esp_mqtt_client_handle_t client, const 
             esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC,
                 "{\"status\":\"error\",\"message\":\"WiFi maintenance in progress\"}", 0, 1, 0);
         } else if (strcmp(command->valuestring, "ping") == 0) {
-            char response[64];
-            snprintf(response, sizeof(response), "{\"msg\":\"pong\"}");
+            char response[256];
+            snprintf(response, sizeof(response), "{\"msg\":\"pong\",\"stop_protocol\":1,\"boot_id\":\"%s\",\"stop_request_id\":\"%s\"}", control_boot_id, control_stop_receipt);
             esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
             ESP_LOGI(TAG, "Responded to ping command");
         } else if (strcmp(command->valuestring, "py") == 0) {
@@ -815,6 +838,17 @@ static void process_system_input_message(esp_mqtt_client_handle_t client, const 
                 }
             }
         } else if (strcmp(command->valuestring, "restart") == 0 || strcmp(command->valuestring, "reset") == 0) {
+            cJSON *receipt = cJSON_GetObjectItemCaseSensitive(json, "stop_request_id");
+            if (receipt) {
+                if (!expected_boot || !cJSON_IsString(receipt) ||
+                        strlen(receipt->valuestring) > 64 ||
+                        strspn(receipt->valuestring, "0123456789abcdef-") != strlen(receipt->valuestring)) {
+                    cJSON_Delete(json);
+                    return;
+                }
+                snprintf(control_stop_receipt, sizeof(control_stop_receipt), "%s", receipt->valuestring);
+                control_receipt_magic = 0x53544f50;
+            }
             stop_motors_for_reset();
             esp_restart();
         } else if (strcmp(command->valuestring, "set-coeff") == 0) {
@@ -1388,12 +1422,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         set_measure_adc_flag(true);
         
         // Publish status
-        char response[256];
+        char response[512];
         snprintf(response, sizeof(response),
                  "{\"type\":\"hello\",\"msg\":\"HAMK line robot firmware\","
                  "\"firmware_revision\":\"%s\",\"firmware_variant\":\"%s\","
-                 "\"bluetooth\":%s,\"calibration_protocol\":1,\"wifi_protocol\":1}",
-                 MICROPY_GIT_HASH, FIRMWARE_VARIANT, FIRMWARE_BLUETOOTH_JSON);
+                 "\"bluetooth\":%s,\"calibration_protocol\":1,\"wifi_protocol\":1,\"stop_protocol\":1,\"boot_id\":\"%s\",\"stop_request_id\":\"%s\"}",
+                 MICROPY_GIT_HASH, FIRMWARE_VARIANT, FIRMWARE_BLUETOOTH_JSON, control_boot_id, control_stop_receipt);
         msg_id = esp_mqtt_client_publish(client, MQTT_SYSTEM_OUTPUT_TOPIC, response, 0, 1, 0);
         ESP_LOGI(TAG, "sent status publish, msg_id=%d", msg_id);
         break;
@@ -1594,6 +1628,7 @@ static void wifi_init_sta()
 
 // MQTT task running on core 1
 void mqtt_task(void *pvParameter) {
+    control_boot_init();
     ESP_LOGI(TAG, "Starting MQTT task on core %d", xPortGetCoreID());
 
     const esp_partition_t *running = esp_ota_get_running_partition();
