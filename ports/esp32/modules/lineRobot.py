@@ -2,7 +2,7 @@ import time
 import math
 import ujson
 import os
-from machine import Pin, PWM, Timer
+from machine import Pin, PWM, Timer, Encoder
 
 class Robot:
     CONFIG_FILE = "settings.json"
@@ -22,10 +22,9 @@ class Robot:
         # Инициализация оборудования
         self._init_hardware(config)
         
-        # Инициализация состояния
-        self._init_state()
-        # Инициалищация interrupt
+        # Hardware counters must exist before logical encoder positions.
         self.begin()
+        self._init_state()
         self.debug = 0
     
     def _load_config(self):
@@ -109,10 +108,10 @@ class Robot:
     
     def _init_hardware(self, config):
         # Motor pins
-        self.in1 = PWM(Pin(config["pml1"]), freq=1000)
-        self.in2 = PWM(Pin(config["pml2"]), freq=1000)
-        self.in3 = PWM(Pin(config["pmr1"]), freq=1000)
-        self.in4 = PWM(Pin(config["pmr2"]), freq=1000)
+        self.in1 = PWM(Pin(config["pml1"]), freq=1000, duty=0)
+        self.in2 = PWM(Pin(config["pml2"]), freq=1000, duty=0)
+        self.in3 = PWM(Pin(config["pmr1"]), freq=1000, duty=0)
+        self.in4 = PWM(Pin(config["pmr2"]), freq=1000, duty=0)
         self.in1.duty(0)
         self.in2.duty(0)
         self.in3.duty(0)
@@ -128,8 +127,6 @@ class Robot:
         # Encoder state
         self.encoder_position_left = 0
         self.encoder_position_right = 0
-        self.last_encoded_l = 0
-        self.last_encoded_r = 0
         
         # Control variables
         self.target_angle = 0
@@ -147,44 +144,28 @@ class Robot:
         self.block = False
         
     def begin(self):
-        """Initialize encoder interrupts"""
-        self.encoder_pin_a_left.irq(trigger=Pin.IRQ_RISING | Pin.IRQ_FALLING, 
-                                   handler=self._update_encoder_left)
-        self.encoder_pin_b_left.irq(trigger=Pin.IRQ_RISING | Pin.IRQ_FALLING, 
-                                   handler=self._update_encoder_left)
-        self.encoder_pin_a_right.irq(trigger=Pin.IRQ_RISING | Pin.IRQ_FALLING, 
-                                    handler=self._update_encoder_right)
-        self.encoder_pin_b_right.irq(trigger=Pin.IRQ_RISING | Pin.IRQ_FALLING, 
-                                    handler=self._update_encoder_right)
-    
-    def _update_encoder_left(self, pin):
-        """Left encoder interrupt handler"""
-        msb_l = self.encoder_pin_a_left.value()
-        lsb_l = self.encoder_pin_b_left.value()
-        encoded_l = (msb_l << 1) | lsb_l
-        sum_l = (self.last_encoded_l << 2) | encoded_l
-        
-        if sum_l in [0b1101, 0b0100, 0b0010, 0b1011]:
-            self.encoder_position_left += 1
-        elif sum_l in [0b1110, 0b0111, 0b0001, 0b1000]:
-            self.encoder_position_left -= 1
-            
-        self.last_encoded_l = encoded_l
-    
-    def _update_encoder_right(self, pin):
-        """Right encoder interrupt handler"""
-        msb_r = self.encoder_pin_a_right.value()
-        lsb_r = self.encoder_pin_b_right.value()
-        encoded_r = (msb_r << 1) | lsb_r
-        sum_r = (self.last_encoded_r << 2) | encoded_r
-        
-        if sum_r in [0b1101, 0b0100, 0b0010, 0b1011]:
-            self.encoder_position_right -= 1
-        elif sum_r in [0b1110, 0b0111, 0b0001, 0b1000]:
-            self.encoder_position_right += 1
-            
-        self.last_encoded_r = encoded_r
-    
+        """Use standard MicroPython quadrature counters backed by ESP32 PCNT."""
+        self._encoder_left = Encoder(0, self.encoder_pin_a_left,
+                                     self.encoder_pin_b_left, phases=4, filter_ns=1250)
+        self._encoder_right = Encoder(1, self.encoder_pin_a_right,
+                                      self.encoder_pin_b_right, phases=4, filter_ns=1250)
+
+    @property
+    def encoder_position_left(self):
+        return self._encoder_left.value()
+
+    @encoder_position_left.setter
+    def encoder_position_left(self, value):
+        self._encoder_left.value(int(value))
+
+    @property
+    def encoder_position_right(self):
+        return -self._encoder_right.value()
+
+    @encoder_position_right.setter
+    def encoder_position_right(self, value):
+        self._encoder_right.value(-int(value))
+
     def constrain(self, value, min_val, max_val):
         """Constrain value between min and max"""
         return max(min_val, min(max_val, value))

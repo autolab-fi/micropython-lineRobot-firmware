@@ -32,6 +32,11 @@
 #include "usb_serial_jtag.h"
 #include "mphalport.h"
 #include "modmachine.h"
+#include "extmod/modmachine.h"
+#include "modesp32.h"
+#if MICROPY_PY_NETWORK_WLAN_CSI
+#include "network_wlan_csi.h"
+#endif
 #include "modnetwork.h"
 #include "settings_manager.h"
 #include "mqtt_handler.h"
@@ -234,8 +239,9 @@ void mp_task(void *pvParameter) {
     #endif
     #if MICROPY_HW_ESP_USB_SERIAL_JTAG
     usb_serial_jtag_init();
-    #elif MICROPY_HW_ENABLE_USBDEV
-    usb_init();
+    #endif
+    #if MICROPY_HW_ENABLE_USBDEV
+    usb_phy_init();
     #endif
     #if MICROPY_HW_ENABLE_UART_REPL
     uart_stdout_init();
@@ -273,6 +279,9 @@ soft_reset:
     // run boot-up scripts
     pyexec_frozen_module("_boot.py", false);
     int ret = pyexec_file_if_exists("boot.py");
+    #if MICROPY_HW_ENABLE_USBDEV
+    mp_usbd_init();
+    #endif
     if (ret & PYEXEC_FORCED_EXIT) {
         goto soft_reset_exit;
     }
@@ -360,13 +369,21 @@ soft_reset_exit:
     MP_STATE_PORT(espnow_singleton) = NULL;
     #endif
 
-    machine_timer_deinit_all();
+    #if MICROPY_PY_NETWORK_WLAN_CSI
+    wifi_csi_deinit();
+    #endif
+    #if MICROPY_PY_MACHINE_UART
+    machine_uart_deinit_all();
+    #endif
+    #if MICROPY_PY_ESP32_PCNT
+    esp32_pcnt_deinit_all();
+    #endif
 
     #if MICROPY_PY_THREAD
     mp_thread_deinit();
     #endif
 
-    #if MICROPY_HW_ENABLE_USB_RUNTIME_DEVICE
+    #if MICROPY_HW_ENABLE_USBDEV
     mp_usbd_deinit();
     #endif
 
@@ -382,6 +399,9 @@ soft_reset_exit:
     // TODO: machine_rmt_deinit_all();
     machine_pins_deinit();
     status_led_end_user_code();
+    #if MICROPY_PY_MACHINE_I2C_TARGET
+    mp_machine_i2c_target_deinit_all();
+    #endif
     machine_deinit();
     #if MICROPY_PY_SOCKET_EVENTS
     socket_events_deinit();

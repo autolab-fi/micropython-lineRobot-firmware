@@ -90,6 +90,9 @@ extern ringbuf_t stdin_ringbuf;
 #define MP_HAL_PIN_SPEED_LOW                    (0)
 #define MP_HAL_PIN_SPEED_HIGH                   (PADCTRL_SLEW_RATE_FAST)
 
+#define MP_HAL_PIN_TRIGGER_FALL                 (1)
+#define MP_HAL_PIN_TRIGGER_RISE                 (2)
+
 #define mp_hal_pin_obj_t const machine_pin_obj_t *
 
 #define MP_HAL_PIN_ALT(function, unit)          (MP_HAL_PIN_ALT_MAKE((MP_HAL_PIN_ALT_##function), (unit)))
@@ -269,6 +272,9 @@ enum {
     MP_HAL_PIN_ALT_UART_TX,
     MP_HAL_PIN_ALT_UT_T0,
     MP_HAL_PIN_ALT_UT_T1,
+    MP_HAL_PIN_ALT_CAN_TXD,
+    MP_HAL_PIN_ALT_CAN_RXD,
+    MP_HAL_PIN_ALT_CAN_STBY,
 };
 
 typedef struct _machine_pin_obj_t {
@@ -309,11 +315,25 @@ static inline void mp_hal_pin_open_drain(mp_hal_pin_obj_t pin) {
     gpio_set_direction_output(pin->gpio, pin->pin);
 }
 
+static inline void mp_hal_pin_config_irq_rising(mp_hal_pin_obj_t pin, bool enable) {
+    if (enable) {
+        gpio_enable_interrupt(pin->gpio, pin->pin);
+        gpio_unmask_interrupt(pin->gpio, pin->pin);
+        gpio_interrupt_set_edge_trigger(pin->gpio, pin->pin);
+        gpio_interrupt_set_polarity_high(pin->gpio, pin->pin);
+        gpio_interrupt_eoi(pin->gpio, pin->pin);
+    } else {
+        gpio_disable_interrupt(pin->gpio, pin->pin);
+    }
+}
+
 static inline void mp_hal_pin_config_irq_falling(mp_hal_pin_obj_t pin, bool enable) {
     if (enable) {
         gpio_enable_interrupt(pin->gpio, pin->pin);
+        gpio_unmask_interrupt(pin->gpio, pin->pin);
         gpio_interrupt_set_edge_trigger(pin->gpio, pin->pin);
         gpio_interrupt_set_polarity_low(pin->gpio, pin->pin);
+        gpio_interrupt_eoi(pin->gpio, pin->pin);
     } else {
         gpio_disable_interrupt(pin->gpio, pin->pin);
     }
@@ -370,3 +390,7 @@ enum {
 void mp_hal_generate_laa_mac(int idx, uint8_t buf[6]);
 void mp_hal_get_mac(int idx, uint8_t buf[6]);
 void mp_hal_get_mac_ascii(int idx, size_t chr_off, size_t chr_len, char *dest);
+
+uint32_t mp_hal_time_get(uint32_t *microseconds);
+
+void mp_hal_get_random(size_t n, uint8_t *buf);

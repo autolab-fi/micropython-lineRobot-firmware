@@ -35,10 +35,15 @@
 # Once the API is stabilised, the idea is that mpremote can be used both
 # as a command line tool and a library for interacting with devices.
 
-import ast, io, os, re, struct, sys, time
-from errno import EPERM
+import ast, io, os, re, stat, struct, sys, time
+import serial
+import serial.tools.list_ports
+from errno import EPERM, ENOTTY
 from .console import VT_ENABLED
 from .transport import TransportError, TransportExecError, Transport
+
+
+VID_SILICON_LABS = 0x10C4
 
 
 class SerialTransport(Transport):
@@ -49,9 +54,6 @@ class SerialTransport(Transport):
         self.use_raw_paste = True
         self.device_name = device
         self.mounted = False
-
-        import serial
-        import serial.tools.list_ports
 
         # Set options, and exclusive if pyserial supports it
         serial_kwargs = {
@@ -65,21 +67,27 @@ class SerialTransport(Transport):
         delayed = False
         for attempt in range(wait + 1):
             try:
-                if device.startswith("rfc2217://"):
-                    self.serial = serial.serial_for_url(device, **serial_kwargs)
-                elif os.name == "nt":
-                    self.serial = serial.Serial(**serial_kwargs)
-                    self.serial.port = device
+                self.serial = serial.serial_for_url(device, do_not_open=True, **serial_kwargs)
+                if os.name == "nt":
                     portinfo = list(serial.tools.list_ports.grep(device))  # type: ignore
-                    if portinfo and portinfo[0].manufacturer != "Microsoft":
-                        # ESP8266/ESP32 boards use RTS/CTS for flashing and boot mode selection.
-                        # DTR False: to avoid using the reset button will hang the MCU in bootloader mode
-                        # RTS False: to prevent pulses on rts on serial.close() that would POWERON_RESET an ESPxx
-                        self.serial.dtr = False  # DTR False = gpio0 High = Normal boot
-                        self.serial.rts = False  # RTS False = EN High = MCU enabled
+                    if portinfo and getattr(portinfo[0], "vid", None) == VID_SILICON_LABS:
+                        # Silicon Labs CP210x driver on Windows has a quirk
+                        # where after a power on reset it will set DTR and RTS
+                        # at different times when the port is opened (it doesn't
+                        # happen on subsequent openings).
+                        #
+                        # To avoid issues with spurious reset on Espressif boards we clear DTR and RTS,
+                        # open the port, and then set them in an order which prevents triggering a reset.
+                        self.serial.dtr = False
+                        self.serial.rts = False
+                        self.serial.open()
+                        self.serial.dtr = True
+                        self.serial.rts = True
+
+                # On all other host/driver combinations we keep the default
+                # behaviour (pyserial will set DTR and RTS automatically on open)
+                if not self.serial.isOpen():
                     self.serial.open()
-                else:
-                    self.serial = serial.Serial(device, **serial_kwargs)
                 break
             except OSError:
                 if wait == 0:
@@ -97,7 +105,31 @@ class SerialTransport(Transport):
         if delayed:
             print("")
 
+        self.is_pty = self._is_pty_device(device)
+
+    @staticmethod
+    def _is_pty_device(device):
+        """Detect if device is a PTY (pseudo-terminal), e.g. used by QEMU."""
+        if device.startswith("/dev/pts/"):
+            try:
+                st = os.stat(device)
+                if stat.S_ISCHR(st.st_mode) and os.major(st.st_rdev) == 136:
+                    return True
+            except (OSError, AttributeError):
+                pass
+        return False
+
     def close(self):
+        # ESP Windows quirk: Prevent target from resetting when Windows clears DTR before RTS
+        try:
+            self.serial.rts = False
+            self.serial.dtr = False
+        except OSError as er:
+            if er.errno == ENOTTY:
+                # Some devices (like QEMU pts) don't support RTS/DTR control
+                pass
+            else:
+                raise er
         self.serial.close()
 
     def read_until(
@@ -122,8 +154,10 @@ class SerialTransport(Transport):
         while True:
             if data.endswith(ending):
                 break
-            elif self.serial.inWaiting() > 0:
+            new_data = None
+            if self.is_pty or self.serial.inWaiting() > 0:
                 new_data = self.serial.read(1)
+            if new_data:
                 if data_consumer:
                     data_consumer(new_data)
                     data = new_data
@@ -518,12 +552,22 @@ class RemoteCommand:
         self.fout.write(self.buf4)
 
     def wr_bytes(self, b):
-        self.wr_s32(len(b))
+        if isinstance(b, str):
+            b = bytes(b, "utf8")
+        self.wr_s32(self.buffer_nbytes(b))
         self.fout.write(b)
 
     # str and bytes act the same in MicroPython
     wr_str = wr_bytes
 
+    def buffer_nbytes(self, obj):
+        if isinstance(obj, (str, bytes, bytearray)):
+            return len(obj)
+        mv = memoryview(obj)
+        if hasattr(mv, "itemsize"):
+            return len(mv) * mv.itemsize
+        # Fallback for uncommon buffer providers.
+        return len(bytes(obj))
 
 class RemoteFile(io.IOBase):
     def __init__(self, cmd, fd, is_text):
@@ -593,7 +637,7 @@ class RemoteFile(io.IOBase):
         c = self.cmd
         c.begin(CMD_READ)
         c.wr_s8(self.fd)
-        c.wr_s32(len(buf))
+        c.wr_s32(c.buffer_nbytes(buf))
         n = c.rd_bytes(buf)
         c.end()
         return n
@@ -790,7 +834,7 @@ class PyboardCommand:
         if n == 0:
             return ""
         else:
-            return str(self.fin.read(n), "utf8")
+            return str(self.fin.read(n), "utf8", errors="backslashreplace")
 
     def wr_s8(self, i):
         self.fout.write(struct.pack("<b", i))
@@ -920,7 +964,7 @@ class PyboardCommand:
         fd = self.rd_s8()
         buf = self.rd_bytes()
         if self.data_files[fd][1]:
-            buf = str(buf, "utf8")
+            buf = str(buf, "utf8", errors="backslashreplace")
         n = self.data_files[fd][0].write(buf)
         self.wr_s32(n)
         # self.log_cmd(f"write {fd} {len(buf)} -> {n}")

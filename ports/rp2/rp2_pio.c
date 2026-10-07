@@ -212,6 +212,7 @@ enum {
     PROG_DATA,
     PROG_OFFSET_PIO0,
     PROG_OFFSET_PIO1,
+    PROG_OFFSET_PIO2,
     PROG_EXECCTRL,
     PROG_SHIFTCTRL,
     PROG_OUT_PINS,
@@ -229,7 +230,7 @@ typedef struct _asm_pio_config_t {
 
 static void asm_pio_override_shiftctrl(mp_obj_t arg, uint32_t bits, uint32_t lsb, pio_sm_config *config) {
     if (arg != mp_const_none) {
-        config->shiftctrl = (config->shiftctrl & ~bits) | (mp_obj_get_int(arg) << lsb);
+        config->shiftctrl = (config->shiftctrl & ~bits) | ((mp_obj_get_int(arg) << lsb) & bits);
     }
 }
 
@@ -270,12 +271,32 @@ static void asm_pio_get_pins(PIO pio, const char *type, mp_obj_t prog_pins, mp_o
     }
 }
 
+static inline uint32_t rotl32a(const uint32_t x, const int k) {
+    return (x << k) | (x >> (32 - k));
+}
+
 static void asm_pio_init_gpio(PIO pio, uint32_t sm, asm_pio_config_t *config) {
-    uint32_t pinmask = ((1 << config->count) - 1) << (config->base - pio_get_gpio_base(pio));
-    pio_sm_set_pins_with_mask(pio, sm, config->pinvals << (config->base - pio_get_gpio_base(pio)), pinmask);
-    pio_sm_set_pindirs_with_mask(pio, sm, config->pindirs << (config->base - pio_get_gpio_base(pio)), pinmask);
-    for (size_t i = 0; i < config->count; ++i) {
-        gpio_set_function(config->base + i, GPIO_FUNC_PIO0 + pio_get_index(pio));
+    uint gpio_base = pio_get_gpio_base(pio);
+    uint32_t pinmask = rotl32a(~(-1 << config->count), config->base - gpio_base);
+    uint32_t pinvals = rotl32a(config->pinvals, config->base - gpio_base);
+    uint32_t pindirs = rotl32a(config->pindirs, config->base - gpio_base);
+
+    #if !PICO_PIO_USE_GPIO_BASE
+    // optimization: avoid 64-bit arithmetic on RP2040 and RP2350A
+    pio_sm_set_pins_with_mask(pio, sm, pinvals, pinmask);
+    pio_sm_set_pindirs_with_mask(pio, sm, pindirs, pinmask);
+    #else
+    uint64_t pinmask64 = (uint64_t)pinmask << gpio_base;
+    uint64_t pinvals64 = (uint64_t)pinvals << gpio_base;
+    uint64_t pindirs64 = (uint64_t)pindirs << gpio_base;
+    pio_sm_set_pins_with_mask64(pio, sm, pinvals64, pinmask64);
+    pio_sm_set_pindirs_with_mask64(pio, sm, pindirs64, pinmask64);
+    #endif
+
+    for (size_t i = 0; i < 32; ++i) {
+        if (pinmask & (1 << i)) {
+            gpio_set_function(gpio_base + i, GPIO_FUNC_PIO0 + pio_get_index(pio));
+        }
     }
 }
 
@@ -683,8 +704,10 @@ static mp_obj_t rp2_state_machine_init_helper(const rp2_state_machine_obj_t *sel
     }
 
     // Configure jmp pin, if needed.
+    int jmp_pin = -1;
     if (args[ARG_jmp_pin].u_obj != mp_const_none) {
-        sm_config_set_jmp_pin(&config, mp_hal_get_pin_obj(args[ARG_jmp_pin].u_obj));
+        jmp_pin = mp_hal_get_pin_obj(args[ARG_jmp_pin].u_obj);
+        sm_config_set_jmp_pin(&config, jmp_pin);
     }
 
     // Configure sideset pin, if needed.
@@ -716,6 +739,18 @@ static mp_obj_t rp2_state_machine_init_helper(const rp2_state_machine_obj_t *sel
     if (set_config.base >= 0) {
         asm_pio_init_gpio(self->pio, self->sm, &set_config);
     }
+    #if !PICO_RP2040
+    if (jmp_pin >= 0) {
+        // On RP2350 pins by default have their isolation enabled.  This means they will
+        // not work as input to a PIO without further configuration.  That's different to
+        // RP2040 where pins can work as PIO input from a reset.  To make RP2350 have
+        // similar behaviour as RP2040, configure the jmp pin for PIO use if it's isolation
+        // is enabled (which means it's probably unconfigured from reset).
+        if (pads_bank0_hw->io[jmp_pin] & PADS_BANK0_GPIO0_ISO_BITS) {
+            pio_gpio_init(self->pio, jmp_pin);
+        }
+    }
+    #endif
     if (sideset_config.base >= 0) {
         asm_pio_init_gpio(self->pio, self->sm, &sideset_config);
     }

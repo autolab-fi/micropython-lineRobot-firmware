@@ -504,3 +504,16 @@ robot.move_forward_distance(25)
 - The robot automatically handles PID control for smooth movement
 - Encoder interrupts provide real-time position feedback
 - The library includes safety features like motor constraining and smooth acceleration
+
+## Hardware encoder backend
+
+On the MicroPython 1.29 robot build, `Robot` uses the standard `machine.Encoder`
+backed by ESP32 PCNT. Encoder pins and `er` retain their existing meanings; both
+edges of both phases are counted. Right-wheel polarity is inverted internally.
+The public position properties and encoder reset methods remain compatible.
+`stop(False)` preserves the positions and `stop()` clears them.
+
+PCNT counts edges without a Python interrupt callback for every edge. Accurate
+counting can change measured speed/distance on robots where the old callbacks
+lost pulses. Validate geometry and speed-control tuning on the physical robot
+after the migration; the firmware does not automatically rewrite coefficients.

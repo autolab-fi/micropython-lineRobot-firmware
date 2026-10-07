@@ -52,7 +52,7 @@ endif
 IDFPY_FLAGS += -D MICROPY_BOARD=$(BOARD) -D MICROPY_BOARD_DIR="$(abspath $(BOARD_DIR))" $(CMAKE_ARGS)
 
 ifdef FROZEN_MANIFEST
-       IDFPY_FLAGS += -D MICROPY_FROZEN_MANIFEST=$(FROZEN_MANIFEST)
+       IDFPY_FLAGS += -D MICROPY_FROZEN_MANIFEST="$(FROZEN_MANIFEST)"
 endif
 
 ifdef BOARD_VARIANT
@@ -98,13 +98,16 @@ monitor:
 	$(call RUN_IDF_PY,$(DEVICE) monitor)
 
 size:
-	$(call RUN_IDF_PY,size)
+	$(call RUN_IDF_PY,size $(SIZE_FLAGS))
 
 size-components:
-	$(call RUN_IDF_PY,size-components)
+	$(call RUN_IDF_PY,size-components $(SIZE_FLAGS))
 
 size-files:
 	$(call RUN_IDF_PY,size-files)
+
+qemu:
+	$(call RUN_IDF_PY,qemu monitor)
 
 # Run idf.py with the UPDATE_SUBMODULES flag to update
 # necessary submodules for this board.
@@ -112,4 +115,4 @@ size-files:
 # This is done in a dedicated build directory as some CMake cache values are not
 # set correctly if not all submodules are loaded yet.
 submodules:
-	$(Q)IDF_COMPONENT_MANAGER=0 idf.py $(IDFPY_FLAGS) -B $(BUILD)/submodules -D UPDATE_SUBMODULES=1 reconfigure
+	$(Q)idf.py $(IDFPY_FLAGS) -B $(BUILD)/submodules -D UPDATE_SUBMODULES=1 reconfigure

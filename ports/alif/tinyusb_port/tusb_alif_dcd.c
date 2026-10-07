@@ -52,7 +52,7 @@ static uint32_t  _evnt_buf[1024] CFG_TUSB_MEM_SECTION __attribute__((aligned(409
 static volatile uint32_t* _evnt_tail;
 
 static uint8_t  _ctrl_buf[64] CFG_TUSB_MEM_SECTION __attribute__((aligned(32))); // [TODO] runtime alloc
-static uint32_t _xfer_trb[8][4] CFG_TUSB_MEM_SECTION __attribute__((aligned(32))); // [TODO] runtime alloc
+static uint32_t _xfer_trb[8][8] CFG_TUSB_MEM_SECTION __attribute__((aligned(32))); // [TODO] runtime alloc
 static uint16_t _xfer_bytes[8];
 static bool     _ctrl_long_data = false;
 static bool     _xfer_cfgd = false;
@@ -75,7 +75,7 @@ void dcd_uninit(void);
 
 // Initializes the USB peripheral for device mode and enables it.
 // This function should enable internal D+/D- pull-up for enumeration.
-void dcd_init(uint8_t rhport)
+bool dcd_init(uint8_t rhport, const tusb_rhport_init_t* rh_init)
 {
     // enable 20mhz clock
     enable_cgu_clk20m();
@@ -172,6 +172,8 @@ void dcd_init(uint8_t rhport)
     NVIC_SetPriority(USB_IRQ_IRQn, 5);
 #endif
     dcd_int_enable(rhport);
+
+    return true;
 }
 
 
@@ -249,8 +251,12 @@ void dcd_set_address(uint8_t rhport, uint8_t dev_addr)
 {
     LOG("%010u >%s", DWT->CYCCNT, __func__);
 
-    udev->dcfg_b.devaddr = dev_addr;
-    dcd_edpt_xfer(rhport, tu_edpt_addr(0, TUSB_DIR_IN), NULL, 0);
+    // Device address is set from the ISR when SETUP packet is received
+    // By point TinyUSB calls this function, the address has already been
+    // set and STATUS sent back to the host. Xfer call below is purely for
+    // internal TinyUSB state to conclude transaction and issue next SETUP req.
+
+    dcd_edpt_xfer(rhport, tu_edpt_addr(0, TUSB_DIR_IN), NULL, 0, false);
 }
 
 // Called to remote wake up host when suspended (e.g hid keyboard)
@@ -361,8 +367,9 @@ void dcd_edpt_close(uint8_t rhport, uint8_t ep_addr) TU_ATTR_WEAK;
 
 // Submit a transfer, When complete dcd_event_xfer_complete() is invoked to
 // notify the stack
-bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t * buffer, uint16_t total_bytes)
+bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t * buffer, uint16_t total_bytes, bool is_isr)
 {
+    (void) is_isr;
     // DEPSTRTXFER command
     LOG("%010u >%s %u %x %u", DWT->CYCCNT, __func__, ep_addr, (uint32_t) buffer, total_bytes);
 
@@ -425,7 +432,7 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t * buffer, uint16_t t
 
 // Submit a transfer using fifo, When complete dcd_event_xfer_complete() is invoked to notify the stack
 // This API is optional, may be useful for register-based for transferring data.
-bool dcd_edpt_xfer_fifo(uint8_t rhport, uint8_t ep_addr, tu_fifo_t * ff, uint16_t total_bytes) TU_ATTR_WEAK;
+bool dcd_edpt_xfer_fifo(uint8_t rhport, uint8_t ep_addr, tu_fifo_t * ff, uint16_t total_bytes, bool is_isr) TU_ATTR_WEAK;
 
 // Stall endpoint, any queuing transfer should be removed from endpoint
 void dcd_edpt_stall(uint8_t rhport, uint8_t ep_addr)
@@ -571,6 +578,9 @@ static void _dcd_handle_depevt(uint8_t ep, uint8_t evt, uint8_t sts, uint16_t pa
 
             // XferNotReady NotActive for status stage
             if ((1 == ep) && (0b0010 == (sts & 0b1011))) {
+                if (0x00 == _ctrl_buf[0] && TUSB_REQ_SET_ADDRESS == _ctrl_buf[1]) {
+                    udev->dcfg_b.devaddr = _ctrl_buf[2];
+                }
                 _dcd_start_xfer(1, NULL, 0, TRBCTL_CTL_STAT2);
                 break;
             }

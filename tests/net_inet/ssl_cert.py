@@ -1,62 +1,23 @@
 import socket
 import ssl
 
+if not hasattr(ssl, "CERT_REQUIRED"):
+    print("SKIP")
+    raise SystemExit
 
-# This certificate was obtained from micropython.org using openssl:
-# $ openssl s_client -showcerts -connect micropython.org:443 </dev/null 2>/dev/null
-# The certificate is from Let's Encrypt:
-# 1 s:C=US, O=Let's Encrypt, CN=R10
-#   i:C=US, O=Internet Security Research Group, CN=ISRG Root X1
-#   a:PKEY: RSA, 2048 (bit); sigalg: sha256WithRSAEncryption
-#   v:NotBefore: Mar 13 00:00:00 2024 GMT; NotAfter: Mar 12 23:59:59 2027 GMT
-# Copy PEM content to a file (mpycert.pem) and convert to DER e.g.
-# $ openssl x509 -in mpycert.pem -out mpycert.der -outform DER
-# Then convert to hex format using: for i in range(0,len(data),40):print(data[i:i+40].hex())
-
-ca_cert_chain = bytes.fromhex(
-    "30820505308202eda00302010202104ba85293f79a2fa273064ba8048d75d0300d06092a864886f7"
-    "0d01010b0500304f310b300906035504061302555331293027060355040a1320496e7465726e6574"
-    "2053656375726974792052657365617263682047726f7570311530130603550403130c4953524720"
-    "526f6f74205831301e170d3234303331333030303030305a170d3237303331323233353935395a30"
-    "33310b300906035504061302555331163014060355040a130d4c6574277320456e6372797074310c"
-    "300a0603550403130352313030820122300d06092a864886f70d01010105000382010f003082010a"
-    "0282010100cf57e5e6c45412edb447fec92758764650288c1d3e88df059dd5b51829bdddb55abffa"
-    "f6cea3beaf00214b625a5a3c012fc55803f689ff8e1143ebc1b5e01407968f6f1fd7e7ba81390975"
-    "65b7c2af185b372628e7a3f4072b6d1affab58bc95ae40ffe9cb57c4b55b7f780d1861bc17e754c6"
-    "bb4991cd6e18d18085eea66536bc74eabc504ceafc21f338169394bab0d36b3806cd16127aca5275"
-    "c8ad76b2c29c5d98455c6f617bc62dee3c13528601d957e6381cdf8db51f92919ae74a1ccc45a872"
-    "55f0b0e6a307ecfda71b669e3f488b71847158c93afaef5ef25b442b3c74e78fb247c1076acd9ab7"
-    "0d96f712812651540aec61f6f7f5e2f28ac8950d8d0203010001a381f83081f5300e0603551d0f01"
-    "01ff040403020186301d0603551d250416301406082b0601050507030206082b0601050507030130"
-    "120603551d130101ff040830060101ff020100301d0603551d0e04160414bbbcc347a5e4bca9c6c3"
-    "a4720c108da235e1c8e8301f0603551d2304183016801479b459e67bb6e5e40173800888c81a58f6"
-    "e99b6e303206082b0601050507010104263024302206082b060105050730028616687474703a2f2f"
-    "78312e692e6c656e63722e6f72672f30130603551d20040c300a3008060667810c01020130270603"
-    "551d1f0420301e301ca01aa0188616687474703a2f2f78312e632e6c656e63722e6f72672f300d06"
-    "092a864886f70d01010b0500038202010092b1e74137eb799d81e6cde225e13a20e9904495a3815c"
-    "cfc35dfdbda070d5b19628220bd2f228cf0ce7d4e6438c24221dc14292d109af9f4bf4c8704f2016"
-    "b15add01f61ff81f616b1427b0728d63aeeee2ce4bcf37ddbba3d4cde7ad50adbdbfe3ec3e623670"
-    "9931a7e88dddea62e212aef59cd43d2c0caad09c79beea3d5c446e9631635a7dd67e4f24a04b057f"
-    "5e6fd2d4ea5f334b13d657b6cade51b85da3098274fdc7789eb3b9ac16da4a2b96c3b68b628ff974"
-    "19a29e03dee96f9bb00fd2a05af6855cc204b7c8d54e32c4bf045dbc29f6f7818f0c5d3c53c94090"
-    "8bfbb60865b9a421d509e51384843782ce1028fc76c206257a46524dda5372a4273f6270acbe6948"
-    "00fb670fdb5ba1e8d703212dd7c9f69942398343df770a1208f125d6ba9419541888a5c58ee11a99"
-    "93796bec1cf93140b0cc3200df9f5ee7b492ab9082918d0de01e95ba593b2e4b5fc2b74635523906"
-    "c0bdaaac52c122a0449799f70ca021a7a16c714716170168c0caa62665047cb3aec9e79455c26f9b"
-    "3c1ca9f92ec5201af076e0beec18d64fd825fb7611e8bfe6210fe8e8ccb5b6a7d5b8f79f41cf6122"
-    "466a83b668972e7cea4e95db23eb2ec82b2884a460e949f4442e3bf9ca625701e25d9016f9c9fc7a"
-    "23488ea6d58172f128fa5dcefbed4e738f942ed241949899dba7af705ff5befb0220bf66276cb4ad"
-    "fa75120b2b3ece039e"
-)
+# For details about this cert, see comment in test_sslcontext_client.py
+root_cert_path = "isrgrootx1.der"
 
 
 def main(use_stream=True):
+    with open(root_cert_path, "rb") as f:
+        cadata = f.read()
     s = socket.socket()
     ai = socket.getaddrinfo("micropython.org", 443)
     addr = ai[0][-1]
     s.connect(addr)
     s = ssl.wrap_socket(
-        s, cert_reqs=ssl.CERT_REQUIRED, cadata=ca_cert_chain, server_hostname="micropython.org"
+        s, cert_reqs=ssl.CERT_REQUIRED, cadata=cadata, server_hostname="micropython.org"
     )
     s.write(b"GET / HTTP/1.0\r\n\r\n")
     print(s.read(17))

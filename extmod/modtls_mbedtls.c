@@ -53,6 +53,7 @@
 #endif
 #include "mbedtls/debug.h"
 #include "mbedtls/error.h"
+#include "mbedtls/ssl_ciphersuites.h"
 #if MBEDTLS_VERSION_NUMBER >= 0x03000000
 #include "mbedtls/build_info.h"
 #else
@@ -61,6 +62,9 @@
 #if MICROPY_PY_SSL_ECDSA_SIGN_ALT
 #include "mbedtls/ecdsa.h"
 #include "mbedtls/asn1.h"
+#endif
+#ifdef MBEDTLS_SSL_DTLS_HELLO_VERIFY
+#include "mbedtls/ssl_cookie.h"
 #endif
 
 #ifndef MICROPY_MBEDTLS_CONFIG_BARE_METAL
@@ -75,7 +79,7 @@
 #define MP_PROTOCOL_TLS_CLIENT  0
 #define MP_PROTOCOL_TLS_SERVER  MP_ENDPOINT_IS_SERVER
 #define MP_PROTOCOL_DTLS_CLIENT MP_TRANSPORT_IS_DTLS
-#define MP_PROTOCOL_DTLS_SERVER MP_ENDPOINT_IS_SERVER | MP_TRANSPORT_IS_DTLS
+#define MP_PROTOCOL_DTLS_SERVER (MP_ENDPOINT_IS_SERVER | MP_TRANSPORT_IS_DTLS)
 
 // This corresponds to an SSLContext object.
 typedef struct _mp_obj_ssl_context_t {
@@ -91,6 +95,15 @@ typedef struct _mp_obj_ssl_context_t {
     mp_obj_t handler;
     #if MICROPY_PY_SSL_ECDSA_SIGN_ALT
     mp_obj_t ecdsa_sign_callback;
+    #endif
+    #if defined(MBEDTLS_SSL_HANDSHAKE_WITH_PSK_ENABLED)
+    mp_obj_t psk_identity; // client: PSK identity to present
+    mp_obj_t psk_key;      // client: PSK key to use
+    mp_obj_t server_psk_keys; // server: mapping of identity -> PSK key
+    #endif
+    #ifdef MBEDTLS_SSL_DTLS_HELLO_VERIFY
+    bool is_dtls_server;
+    mbedtls_ssl_cookie_ctx cookie_ctx;
     #endif
 } mp_obj_ssl_context_t;
 
@@ -117,7 +130,8 @@ static const mp_obj_type_t ssl_socket_type;
 static const MP_DEFINE_STR_OBJ(mbedtls_version_obj, MBEDTLS_VERSION_STRING_FULL);
 
 static mp_obj_t ssl_socket_make_new(mp_obj_ssl_context_t *ssl_context, mp_obj_t sock,
-    bool server_side, bool do_handshake_on_connect, mp_obj_t server_hostname);
+    bool server_side, bool do_handshake_on_connect, mp_obj_t server_hostname,
+    mp_obj_t client_id);
 
 /******************************************************************************/
 // Helper functions.
@@ -284,6 +298,11 @@ static mp_obj_t ssl_context_make_new(const mp_obj_type_t *type_in, size_t n_args
     #if MICROPY_PY_SSL_ECDSA_SIGN_ALT
     self->ecdsa_sign_callback = mp_const_none;
     #endif
+    #if defined(MBEDTLS_SSL_HANDSHAKE_WITH_PSK_ENABLED)
+    self->psk_identity = mp_const_none;
+    self->psk_key = mp_const_none;
+    self->server_psk_keys = mp_const_none;
+    #endif
 
     #ifdef MBEDTLS_DEBUG_C
     // Debug level (0-4) 1=warning, 2=info, 3=debug, 4=verbose
@@ -296,7 +315,7 @@ static mp_obj_t ssl_context_make_new(const mp_obj_type_t *type_in, size_t n_args
     psa_crypto_init();
     #endif
 
-    const byte seed[] = "upy";
+    const byte seed[] = "mpy";
     int ret = mbedtls_ctr_drbg_seed(&self->ctr_drbg, mbedtls_entropy_func, &self->entropy, seed, sizeof(seed));
     if (ret != 0) {
         mbedtls_raise_error(ret);
@@ -320,8 +339,28 @@ static mp_obj_t ssl_context_make_new(const mp_obj_type_t *type_in, size_t n_args
     mbedtls_ssl_conf_dbg(&self->conf, mbedtls_debug, NULL);
     #endif
 
+    #ifdef MBEDTLS_SSL_DTLS_HELLO_VERIFY
+    self->is_dtls_server = (protocol == MP_PROTOCOL_DTLS_SERVER);
+    if (self->is_dtls_server) {
+        mbedtls_ssl_cookie_init(&self->cookie_ctx);
+        ret = mbedtls_ssl_cookie_setup(&self->cookie_ctx, mbedtls_ctr_drbg_random, &self->ctr_drbg);
+        if (ret != 0) {
+            mbedtls_raise_error(ret);
+        }
+        mbedtls_ssl_conf_dtls_cookies(&self->conf, mbedtls_ssl_cookie_write, mbedtls_ssl_cookie_check,
+            &self->cookie_ctx);
+    }
+    #endif // MBEDTLS_SSL_DTLS_HELLO_VERIFY
+
     return MP_OBJ_FROM_PTR(self);
 }
+
+#if defined(MBEDTLS_SSL_HANDSHAKE_WITH_PSK_ENABLED)
+static void ssl_context_restrict_to_psk_ciphersuites(mp_obj_ssl_context_t *self);
+static int ssl_context_psk_server_callback(void *p_ctx, mbedtls_ssl_context *ssl,
+    const unsigned char *identity, size_t identity_len);
+static void ssl_context_set_psk(mp_obj_ssl_context_t *self);
+#endif
 
 static void ssl_context_attr(mp_obj_t self_in, qstr attr, mp_obj_t *dest) {
     mp_obj_ssl_context_t *self = MP_OBJ_TO_PTR(self_in);
@@ -334,6 +373,14 @@ static void ssl_context_attr(mp_obj_t self_in, qstr attr, mp_obj_t *dest) {
         #if MICROPY_PY_SSL_ECDSA_SIGN_ALT
         } else if (attr == MP_QSTR_ecdsa_sign_callback) {
             dest[0] = self->ecdsa_sign_callback;
+        #endif
+        #if defined(MBEDTLS_SSL_HANDSHAKE_WITH_PSK_ENABLED)
+        } else if (attr == MP_QSTR_psk_identity) {
+            dest[0] = self->psk_identity;
+        } else if (attr == MP_QSTR_psk_key) {
+            dest[0] = self->psk_key;
+        } else if (attr == MP_QSTR_server_psk_keys) {
+            dest[0] = self->server_psk_keys;
         #endif
         } else {
             // Continue lookup in locals_dict.
@@ -349,6 +396,21 @@ static void ssl_context_attr(mp_obj_t self_in, qstr attr, mp_obj_t *dest) {
         } else if (attr == MP_QSTR_ecdsa_sign_callback) {
             dest[0] = MP_OBJ_NULL;
             self->ecdsa_sign_callback = dest[1];
+        #endif
+        #if defined(MBEDTLS_SSL_HANDSHAKE_WITH_PSK_ENABLED)
+        } else if (attr == MP_QSTR_psk_identity) {
+            dest[0] = MP_OBJ_NULL;
+            self->psk_identity = dest[1];
+            ssl_context_set_psk(self);
+        } else if (attr == MP_QSTR_psk_key) {
+            dest[0] = MP_OBJ_NULL;
+            self->psk_key = dest[1];
+            ssl_context_set_psk(self);
+        } else if (attr == MP_QSTR_server_psk_keys) {
+            dest[0] = MP_OBJ_NULL;
+            self->server_psk_keys = dest[1];
+            mbedtls_ssl_conf_psk_cb(&self->conf, ssl_context_psk_server_callback, self);
+            ssl_context_restrict_to_psk_ciphersuites(self);
         #endif
         } else if (attr == MP_QSTR_verify_callback) {
             dest[0] = MP_OBJ_NULL;
@@ -366,6 +428,11 @@ static mp_obj_t ssl_context___del__(mp_obj_t self_in) {
     mbedtls_ctr_drbg_free(&self->ctr_drbg);
     mbedtls_entropy_free(&self->entropy);
     mbedtls_ssl_config_free(&self->conf);
+    #ifdef MBEDTLS_SSL_DTLS_HELLO_VERIFY
+    if (self->is_dtls_server) {
+        mbedtls_ssl_cookie_free(&self->cookie_ctx);
+    }
+    #endif
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(ssl_context___del___obj, ssl_context___del__);
@@ -467,12 +534,104 @@ static mp_obj_t ssl_context_load_verify_locations(mp_obj_t self_in, mp_obj_t cad
 }
 static MP_DEFINE_CONST_FUN_OBJ_2(ssl_context_load_verify_locations_obj, ssl_context_load_verify_locations);
 
+#if defined(MBEDTLS_SSL_HANDSHAKE_WITH_PSK_ENABLED)
+// mbedtls_ssl_ciphersuite_uses_psk() is declared only in mbedTLS's private
+// library/ssl_ciphersuites_internal.h, but it is a regular (linkable) symbol.
+// Declare it here so it can be used without pulling in that private header.
+int mbedtls_ssl_ciphersuite_uses_psk(const mbedtls_ssl_ciphersuite_t *info);
+
+// Restrict the context to offer/accept only PSK cipher suites, so a PSK
+// connection cannot silently fall back to a non-PSK (e.g. certificate-based)
+// suite.  Does nothing if the user already chose ciphers via set_ciphers().
+static void ssl_context_restrict_to_psk_ciphersuites(mp_obj_ssl_context_t *self) {
+    if (self->ciphersuites != NULL) {
+        return;
+    }
+    const int *all = mbedtls_ssl_list_ciphersuites();
+    size_t n = 0;
+    for (const int *c = all; *c != 0; ++c) {
+        const mbedtls_ssl_ciphersuite_t *info = mbedtls_ssl_ciphersuite_from_id(*c);
+        if (info != NULL && mbedtls_ssl_ciphersuite_uses_psk(info)) {
+            ++n;
+        }
+    }
+    self->ciphersuites = m_new(int, n + 1);
+    size_t i = 0;
+    for (const int *c = all; *c != 0; ++c) {
+        const mbedtls_ssl_ciphersuite_t *info = mbedtls_ssl_ciphersuite_from_id(*c);
+        if (info != NULL && mbedtls_ssl_ciphersuite_uses_psk(info)) {
+            self->ciphersuites[i++] = *c;
+        }
+    }
+    self->ciphersuites[i] = 0;
+    mbedtls_ssl_conf_ciphersuites(&self->conf, self->ciphersuites);
+}
+
+// Install the client-side PSK (identity and key) into the mbedTLS config.  Both
+// the psk_identity and psk_key context attributes must be set, so this is a
+// no-op until then.  Also restricts the context to PSK cipher suites.
+static void ssl_context_set_psk(mp_obj_ssl_context_t *self) {
+    if (self->psk_identity == mp_const_none || self->psk_key == mp_const_none) {
+        return;
+    }
+    size_t identity_len;
+    const char *identity = mp_obj_str_get_data(self->psk_identity, &identity_len);
+    mp_buffer_info_t key;
+    mp_get_buffer_raise(self->psk_key, &key, MP_BUFFER_READ);
+    int ret = mbedtls_ssl_conf_psk(&self->conf, key.buf, key.len,
+        (const unsigned char *)identity, identity_len);
+    if (ret != 0) {
+        mbedtls_raise_error(ret);
+    }
+    ssl_context_restrict_to_psk_ciphersuites(self);
+}
+
+// mbedTLS server-side PSK callback.  It is invoked during the handshake with
+// the identity presented by the client.  The identity is passed to the lookup
+// as a `bytes` object (it is an opaque octet string on the wire, not
+// necessarily valid UTF-8).  We look it up by calling server_psk_keys.get()
+// (so a dict, or any object with a get() method, can be used) and install the
+// result as the key for this handshake.  A result of None (e.g. an unknown
+// identity) rejects the handshake.
+static int ssl_context_psk_server_callback(void *p_ctx, mbedtls_ssl_context *ssl,
+    const unsigned char *identity, size_t identity_len) {
+    mp_obj_ssl_context_t *self = (mp_obj_ssl_context_t *)p_ctx;
+    if (self->server_psk_keys == mp_const_none) {
+        return -1;
+    }
+    nlr_buf_t nlr;
+    if (nlr_push(&nlr) == 0) {
+        // Call server_psk_keys.get(identity), returning None for an unknown
+        // identity rather than raising (and catching) KeyError.
+        mp_obj_t dest[3];
+        mp_load_method(self->server_psk_keys, MP_QSTR_get, dest);
+        dest[2] = mp_obj_new_bytes(identity, identity_len);
+        mp_obj_t key = mp_call_method_n_kw(1, 0, dest);
+        int ret = -1;
+        if (key != mp_const_none) {
+            mp_buffer_info_t bufinfo;
+            mp_get_buffer_raise(key, &bufinfo, MP_BUFFER_READ);
+            ret = mbedtls_ssl_set_hs_psk(ssl, bufinfo.buf, bufinfo.len);
+        }
+        nlr_pop();
+        return ret;
+    } else {
+        // The lookup misbehaved (e.g. server_psk_keys has no get() method, or
+        // get() raised, or returned a non-bytes value); reject the handshake.
+        return -1;
+    }
+}
+#endif
+
 static mp_obj_t ssl_context_wrap_socket(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
-    enum { ARG_server_side, ARG_do_handshake_on_connect, ARG_server_hostname };
+    enum { ARG_server_side, ARG_do_handshake_on_connect, ARG_server_hostname, ARG_client_id };
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_server_side, MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = false} },
         { MP_QSTR_do_handshake_on_connect, MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = true} },
         { MP_QSTR_server_hostname, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = MP_ROM_NONE} },
+        #ifdef MBEDTLS_SSL_DTLS_HELLO_VERIFY
+        { MP_QSTR_client_id, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = MP_ROM_NONE} },
+        #endif
     };
 
     // Parse arguments.
@@ -481,9 +640,14 @@ static mp_obj_t ssl_context_wrap_socket(size_t n_args, const mp_obj_t *pos_args,
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all(n_args - 2, pos_args + 2, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
+    mp_obj_t client_id = mp_const_none;
+    #ifdef MBEDTLS_SSL_DTLS_HELLO_VERIFY
+    client_id = args[ARG_client_id].u_obj;
+    #endif
+
     // Create and return the new SSLSocket object.
     return ssl_socket_make_new(self, sock, args[ARG_server_side].u_bool,
-        args[ARG_do_handshake_on_connect].u_bool, args[ARG_server_hostname].u_obj);
+        args[ARG_do_handshake_on_connect].u_bool, args[ARG_server_hostname].u_obj, client_id);
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(ssl_context_wrap_socket_obj, 2, ssl_context_wrap_socket);
 
@@ -580,7 +744,7 @@ static int _mbedtls_timing_get_delay(void *ctx) {
 #endif
 
 static mp_obj_t ssl_socket_make_new(mp_obj_ssl_context_t *ssl_context, mp_obj_t sock,
-    bool server_side, bool do_handshake_on_connect, mp_obj_t server_hostname) {
+    bool server_side, bool do_handshake_on_connect, mp_obj_t server_hostname, mp_obj_t client_id) {
 
     // Store the current SSL context.
     store_active_context(ssl_context);
@@ -605,7 +769,7 @@ static mp_obj_t ssl_socket_make_new(mp_obj_ssl_context_t *ssl_context, mp_obj_t 
 
     ret = mbedtls_ssl_setup(&o->ssl, &ssl_context->conf);
     #if !MICROPY_MBEDTLS_CONFIG_BARE_METAL
-    if (ret == MBEDTLS_ERR_SSL_ALLOC_FAILED) {
+    if (ret != 0) {
         // If mbedTLS relies on platform libc heap for buffers (i.e. esp32
         // port), then run a GC pass and then try again. This is useful because
         // it may free a Python object (like an old SSL socket) whose finaliser
@@ -633,6 +797,20 @@ static mp_obj_t ssl_socket_make_new(mp_obj_ssl_context_t *ssl_context, mp_obj_t 
 
     #ifdef MBEDTLS_SSL_PROTO_DTLS
     mbedtls_ssl_set_timer_cb(&o->ssl, o, _mbedtls_timing_set_delay, _mbedtls_timing_get_delay);
+    #endif
+
+    #ifdef MBEDTLS_SSL_DTLS_HELLO_VERIFY
+    if (ssl_context->is_dtls_server) {
+        // require the client_id parameter for DTLS (as per mbedTLS requirement)
+        ret = MBEDTLS_ERR_SSL_BAD_INPUT_DATA;
+        mp_buffer_info_t buf;
+        if (mp_get_buffer(client_id, &buf, MP_BUFFER_READ)) {
+            ret = mbedtls_ssl_set_client_transport_id(&o->ssl, buf.buf, buf.len);
+        }
+        if (ret != 0) {
+            goto cleanup;
+        }
+    }
     #endif
 
     mbedtls_ssl_set_bio(&o->ssl, &o->sock, _mbedtls_ssl_send, _mbedtls_ssl_recv, NULL);
@@ -822,7 +1000,14 @@ static mp_uint_t socket_ioctl(mp_obj_t o_in, mp_uint_t request, uintptr_t arg, i
                 }
             }
         }
-    } else {
+    }
+    #if MICROPY_STREAMS_DELEGATE_ERROR
+    else if (request == MP_STREAM_RAISE_ERROR) {
+        // Raise error with detailed error string
+        mbedtls_raise_error((int)arg);
+    }
+    #endif
+    else {
         // Unsupported ioctl.
         *errcode = MP_EINVAL;
         return MP_STREAM_ERROR;

@@ -515,8 +515,17 @@ static const mp_rom_map_elem_t machine_pin_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_ALT_SIO), MP_ROM_INT(GPIO_FUNC_SIO) },
     { MP_ROM_QSTR(MP_QSTR_ALT_PIO0), MP_ROM_INT(GPIO_FUNC_PIO0) },
     { MP_ROM_QSTR(MP_QSTR_ALT_PIO1), MP_ROM_INT(GPIO_FUNC_PIO1) },
+    #if NUM_PIOS >= 3
+    { MP_ROM_QSTR(MP_QSTR_ALT_PIO2), MP_ROM_INT(GPIO_FUNC_PIO2) },
+    #endif
     { MP_ROM_QSTR(MP_QSTR_ALT_GPCK), MP_ROM_INT(GPIO_FUNC_GPCK) },
     { MP_ROM_QSTR(MP_QSTR_ALT_USB), MP_ROM_INT(GPIO_FUNC_USB) },
+    #if PICO_RP2350
+    { MP_ROM_QSTR(MP_QSTR_ALT_HSTX), MP_ROM_INT(GPIO_FUNC_HSTX) },
+    { MP_ROM_QSTR(MP_QSTR_ALT_XIP_CS1), MP_ROM_INT(GPIO_FUNC_XIP_CS1) },
+    { MP_ROM_QSTR(MP_QSTR_ALT_CORESIGHT_TRACE), MP_ROM_INT(GPIO_FUNC_CORESIGHT_TRACE) },
+    { MP_ROM_QSTR(MP_QSTR_ALT_UART_AUX), MP_ROM_INT(GPIO_FUNC_UART_AUX) },
+    #endif
 };
 static MP_DEFINE_CONST_DICT(machine_pin_locals_dict, machine_pin_locals_dict_table);
 
@@ -597,4 +606,4 @@ mp_hal_pin_obj_t mp_hal_get_pin_obj(mp_obj_t obj) {
     return pin->id;
 }
 
-MP_REGISTER_ROOT_POINTER(void *machine_pin_irq_obj[30]);
+MP_REGISTER_ROOT_POINTER(void *machine_pin_irq_obj[NUM_BANK0_GPIOS]);

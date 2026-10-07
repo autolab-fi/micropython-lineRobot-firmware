@@ -11,6 +11,7 @@
 #include "nvs_flash.h"
 #include "esp_task.h"
 #include "esp_event.h"
+#include "esp_flash.h"
 #include "esp_log.h"
 #include "esp_memory_utils.h"
 #include "esp_psram.h"
@@ -27,6 +28,7 @@
 #include "py/repl.h"
 #include "py/gc.h"
 #include "py/mphal.h"
+#include "extmod/modmachine.h"
 #include "shared/readline/readline.h"
 #include "shared/runtime/pyexec.h"
 #include "shared/timeutils/timeutils.h"
@@ -36,8 +38,12 @@
 #include "uart.h"
 #include "usb.h"
 #include "usb_serial_jtag.h"
+#include "modesp32.h"
 #include "modmachine.h"
 #include "modnetwork.h"
+#if MICROPY_PY_NETWORK_WLAN_CSI
+#include "network_wlan_csi.h"
+#endif
 
 // Include our custom modules
 #include "settings_manager.h"
@@ -72,18 +78,47 @@ int vprintf_null(const char *format, va_list ap) {
     return 0;
 }
 
-time_t platform_mbedtls_time(time_t *timer) {
+#if MICROPY_SSL_MBEDTLS
+static time_t platform_mbedtls_time(time_t *timer) {
     // mbedtls_time requires time in seconds from EPOCH 1970
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return tv.tv_sec + TIMEUTILS_SECONDS_1970_TO_2000;
 }
+#endif
 
 void boardctrl_startup(void) {
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
         nvs_flash_init();
+    }
+
+    // Query the physical size of the SPI flash and store it in the size
+    // variable of the global, default SPI flash handle.
+    esp_flash_get_physical_size(NULL, &esp_flash_default_chip->size);
+
+    // If there is no filesystem partition (no "vfs" or "ffat"), add a "vfs" partition
+    // that extends from the end of the application partition up to the end of flash.
+    if (esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "vfs") == NULL
+        && esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "ffat") == NULL) {
+        // No "vfs" or "ffat" partition, so try to create one.
+
+        // Find the end of the last partition that exists in the partition table.
+        size_t offset = 0;
+        esp_partition_iterator_t iter = esp_partition_find(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, NULL);
+        while (iter != NULL) {
+            const esp_partition_t *part = esp_partition_get(iter);
+            offset = MAX(offset, part->address + part->size);
+            iter = esp_partition_next(iter);
+        }
+
+        // If we found the application partition and there is some space between the end of
+        // that and the end of flash, create a "vfs" partition taking up all of that space.
+        if (offset > 0 && esp_flash_default_chip->size > offset) {
+            size_t size = esp_flash_default_chip->size - offset;
+            esp_partition_register_external(esp_flash_default_chip, offset, size, "vfs", ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT, NULL);
+        }
     }
 }
 
@@ -160,4 +195,15 @@ void MICROPY_ESP_IDF_ENTRY(void) {
 
     // Write settings to MicroPython file system
     write_settings_to_micropython();
+}
+
+
+// Workaround for https://github.com/espressif/esp-insights/issues/38
+extern int  __real_esp_efuse_rtc_calib_get_ver(void);
+int __wrap_esp_efuse_rtc_calib_get_ver(void) {
+    #if CONFIG_ETH_USE_OPENETH // detect QEMU build
+    return 1;
+    #else
+    return __real_esp_efuse_rtc_calib_get_ver();
+    #endif
 }

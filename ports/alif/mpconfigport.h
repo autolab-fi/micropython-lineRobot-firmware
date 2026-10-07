@@ -87,9 +87,7 @@
 // MicroPython emitters
 #define MICROPY_PERSISTENT_CODE_LOAD            (1)
 #define MICROPY_EMIT_THUMB                      (1)
-#define MICROPY_EMIT_THUMB_ARMV7M               (1)
 #define MICROPY_EMIT_INLINE_THUMB               (1)
-#define MICROPY_EMIT_INLINE_THUMB_FLOAT         (1)
 
 // Optimisations
 #define MICROPY_OPT_COMPUTED_GOTO               (1)
@@ -97,6 +95,7 @@
 // Python internal features
 #define MICROPY_READER_VFS                      (1)
 #define MICROPY_ENABLE_GC                       (1)
+#define MICROPY_STACK_CHECK_MARGIN              (1024)
 #define MICROPY_ENABLE_EMERGENCY_EXCEPTION_BUF  (1)
 #define MICROPY_LONGINT_IMPL                    (MICROPY_LONGINT_IMPL_MPZ)
 #ifndef MICROPY_FLOAT_IMPL
@@ -112,14 +111,15 @@
 
 // Extended modules
 #define MICROPY_EPOCH_IS_1970                   (1)
-#define MICROPY_PY_OS_INCLUDEFILE               "ports/alif/modos.c"
 #define MICROPY_PY_OS_DUPTERM                   (1)
 #define MICROPY_PY_OS_SEP                       (1)
 #define MICROPY_PY_OS_SYNC                      (1)
 #define MICROPY_PY_OS_UNAME                     (1)
 #define MICROPY_PY_OS_URANDOM                   (1)
 #define MICROPY_PY_RANDOM_SEED_INIT_FUNC        (se_services_rand64())
-#define MICROPY_PY_TIME                         (1)
+#define MICROPY_PY_TIME_GMTIME_LOCALTIME_MKTIME (1)
+#define MICROPY_PY_TIME_TIME_TIME_NS            (1)
+#define MICROPY_PY_TIME_INCLUDEFILE             "ports/alif/modtime.c"
 #define MICROPY_PY_MACHINE                      (1)
 #define MICROPY_PY_MACHINE_INCLUDEFILE          "ports/alif/modmachine.c"
 #define MICROPY_PY_MACHINE_RESET                (1)
@@ -130,8 +130,21 @@
 #define MICROPY_PY_MACHINE_ADC_INCLUDEFILE      "ports/alif/machine_adc.c"
 #define MICROPY_PY_MACHINE_DHT_READINTO         (1)
 #define MICROPY_PY_MACHINE_PULSE                (1)
+#define MICROPY_PY_MACHINE_PWM                  (1)
+#define MICROPY_PY_MACHINE_PWM_INCLUDEFILE      "ports/alif/machine_pwm.c"
 #define MICROPY_PY_MACHINE_I2C                  (MICROPY_HW_ENABLE_HW_I2C)
 #define MICROPY_PY_MACHINE_I2C_TRANSFER_WRITE1  (1)
+#ifndef MICROPY_PY_MACHINE_I2C_TARGET
+#define MICROPY_PY_MACHINE_I2C_TARGET           (MICROPY_HW_ENABLE_HW_I2C)
+#define MICROPY_PY_MACHINE_I2C_TARGET_INCLUDEFILE "ports/alif/machine_i2c_target.c"
+#define MICROPY_PY_MACHINE_I2C_TARGET_MAX       (4)
+#define MICROPY_PY_MACHINE_I2C_TARGET_HARD_IRQ  (1)
+#endif
+#define MICROPY_PY_MACHINE_CAN_INCLUDEFILE      "ports/alif/machine_can.c"
+// Function to determine if the given can_id is reserved for system use or not.
+#ifndef MICROPY_HW_CAN_IS_RESERVED
+#define MICROPY_HW_CAN_IS_RESERVED(can_id) (false)
+#endif
 #define MICROPY_PY_MACHINE_SOFTI2C              (1)
 #define MICROPY_PY_MACHINE_SPI                  (1)
 #define MICROPY_PY_MACHINE_SOFTSPI              (1)
@@ -139,6 +152,12 @@
 #define MICROPY_PY_MACHINE_UART                 (1)
 #define MICROPY_PY_MACHINE_UART_INCLUDEFILE     "ports/alif/machine_uart.c"
 #define MICROPY_PY_MACHINE_UART_IRQ             (1)
+#ifndef MICROPY_PY_MACHINE_MEM_BACKUP
+#define MICROPY_PY_MACHINE_MEM_BACKUP           (1)
+#endif
+#define MICROPY_PY_MACHINE_MEM_BACKUP_INCLUDEFILE "ports/alif/machine_mem_backup.c"
+#define MICROPY_PY_MACHINE_WDT                  (1)
+#define MICROPY_PY_MACHINE_WDT_INCLUDEFILE      "ports/alif/machine_wdt.c"
 #define MICROPY_PY_NETWORK                      (CORE_M55_HP)
 #ifndef MICROPY_PY_NETWORK_HOSTNAME_DEFAULT
 #define MICROPY_PY_NETWORK_HOSTNAME_DEFAULT     "mpy-alif"
@@ -158,19 +177,11 @@
 #define MICROPY_FATFS_MAX_SS                    (MICROPY_HW_FLASH_BLOCK_SIZE_BYTES)
 #endif
 
-#if MICROPY_PY_NETWORK_CYW43
-extern const struct _mp_obj_type_t mp_network_cyw43_type;
-#define MICROPY_HW_NIC_CYW43 { MP_ROM_QSTR(MP_QSTR_WLAN), MP_ROM_PTR(&mp_network_cyw43_type) },
-#else
-#define MICROPY_HW_NIC_CYW43
-#endif
-
 #ifndef MICROPY_BOARD_NETWORK_INTERFACES
 #define MICROPY_BOARD_NETWORK_INTERFACES
 #endif
 
 #define MICROPY_PORT_NETWORK_INTERFACES \
-    MICROPY_HW_NIC_CYW43 \
     MICROPY_BOARD_NETWORK_INTERFACES \
 
 // Bluetooth code only runs in the scheduler, no locking/mutex required.
@@ -190,12 +201,7 @@ extern const struct _mp_obj_type_t mp_network_cyw43_type;
 
 #define MP_SSIZE_MAX (0x7fffffff)
 
-// Assume that if we already defined the obj repr then we also defined these items
-#ifndef MICROPY_OBJ_REPR
-typedef intptr_t mp_int_t; // must be pointer size
-typedef uintptr_t mp_uint_t; // must be pointer size
 typedef intptr_t mp_off_t;
-#endif
 
 // Board configuration settings.
 

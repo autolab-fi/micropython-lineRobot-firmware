@@ -27,6 +27,7 @@
 #include <assert.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -196,7 +197,6 @@ typedef enum {
     CALL_R,   // Opcode Register
     CALL_RL,  // Opcode Register, Label
     CALL_N,   // Opcode
-    CALL_I,   // Opcode Immediate
     CALL_RII, // Opcode Register, Register, Immediate
     CALL_RIR, // Opcode Register, Immediate(Register)
     CALL_COUNT
@@ -210,7 +210,6 @@ typedef enum {
 #define U (1 << 2) // Unsigned immediate
 #define Z (1 << 3) // Non-zero
 
-typedef void (*call_l_t)(asm_rv32_t *state, mp_uint_t label_index);
 typedef void (*call_ri_t)(asm_rv32_t *state, mp_uint_t rd, mp_int_t immediate);
 typedef void (*call_rri_t)(asm_rv32_t *state, mp_uint_t rd, mp_uint_t rs1, mp_int_t immediate);
 typedef void (*call_rii_t)(asm_rv32_t *state, mp_uint_t rd, mp_uint_t immediate1, mp_int_t immediate2);
@@ -225,7 +224,7 @@ typedef struct _opcode_t {
     uint16_t argument1_mask : 4;
     uint16_t argument2_mask : 4;
     uint16_t argument3_mask : 4;
-    uint16_t arguments_count : 2;
+    uint16_t parse_nodes : 2;
     // 2 bits available here
     uint32_t calling_convention : 4;
     uint32_t argument1_kind : 4;
@@ -234,7 +233,8 @@ typedef struct _opcode_t {
     uint32_t argument2_shift : 4;
     uint32_t argument3_kind : 4;
     uint32_t argument3_shift : 4;
-    // 4 bits available here
+    uint32_t required_extensions : 1;
+    // 3 bits available here
     void *emitter;
 } opcode_t;
 
@@ -297,88 +297,91 @@ static const uint32_t OPCODE_MASKS[] = {
 };
 
 static const opcode_t OPCODES[] = {
-    { MP_QSTR_add,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, asm_rv32_opcode_add       },
-    { MP_QSTR_addi,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00000FFF, 3, CALL_RRI, R,  0, R,   0,  I,  0, asm_rv32_opcode_addi      },
-    { MP_QSTR_and_,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, asm_rv32_opcode_and       },
-    { MP_QSTR_andi,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00000FFF, 3, CALL_RRI, R,  0, R,   0,  I,  0, asm_rv32_opcode_andi      },
-    { MP_QSTR_auipc,      MASK_FFFFFFFF, MASK_FFFFF000, MASK_NOT_USED, 2, CALL_RI,  R,  0, I,   12, N,  0, asm_rv32_opcode_auipc     },
-    { MP_QSTR_beq,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00001FFE, 3, CALL_RRL, R,  0, R,   0,  L,  0, asm_rv32_opcode_beq       },
-    { MP_QSTR_bge,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00001FFE, 3, CALL_RRL, R,  0, R,   0,  L,  0, asm_rv32_opcode_bge       },
-    { MP_QSTR_bgeu,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00001FFE, 3, CALL_RRL, R,  0, R,   0,  L,  0, asm_rv32_opcode_bgeu      },
-    { MP_QSTR_blt,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00001FFE, 3, CALL_RRL, R,  0, R,   0,  L,  0, asm_rv32_opcode_blt       },
-    { MP_QSTR_bltu,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00001FFE, 3, CALL_RRL, R,  0, R,   0,  L,  0, asm_rv32_opcode_bltu      },
-    { MP_QSTR_bne,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00001FFE, 3, CALL_RRL, R,  0, R,   0,  L,  0, asm_rv32_opcode_bne       },
-    { MP_QSTR_csrrc,      MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00000FFF, 3, CALL_RRI, R,  0, R,   0,  IU, 0, asm_rv32_opcode_csrrc     },
-    { MP_QSTR_csrrs,      MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00000FFF, 3, CALL_RRI, R,  0, R,   0,  IU, 0, asm_rv32_opcode_csrrs     },
-    { MP_QSTR_csrrw,      MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00000FFF, 3, CALL_RRI, R,  0, R,   0,  IU, 0, asm_rv32_opcode_csrrw     },
-    { MP_QSTR_csrrci,     MASK_FFFFFFFF, MASK_00000FFF, MASK_0000001F, 3, CALL_RII, R,  0, IU,  0,  IU, 0, asm_rv32_opcode_csrrci    },
-    { MP_QSTR_csrrsi,     MASK_FFFFFFFF, MASK_00000FFF, MASK_0000001F, 3, CALL_RII, R,  0, IU,  0,  IU, 0, asm_rv32_opcode_csrrsi    },
-    { MP_QSTR_csrrwi,     MASK_FFFFFFFF, MASK_00000FFF, MASK_0000001F, 3, CALL_RII, R,  0, IU,  0,  IU, 0, asm_rv32_opcode_csrrwi    },
-    { MP_QSTR_c_add,      MASK_FFFFFFFE, MASK_FFFFFFFE, MASK_NOT_USED, 2, CALL_RR,  R,  0, R,   0,  N,  0, asm_rv32_opcode_cadd      },
-    { MP_QSTR_c_addi,     MASK_FFFFFFFE, MASK_0000003F, MASK_NOT_USED, 2, CALL_RI,  R,  0, IZ,  0,  N,  0, asm_rv32_opcode_caddi     },
-    { MP_QSTR_c_addi4spn, MASK_0000FF00, MASK_000003FC, MASK_NOT_USED, 2, CALL_RI,  R,  0, IUZ, 0,  N,  0, asm_rv32_opcode_caddi4spn },
-    { MP_QSTR_c_and,      MASK_0000FF00, MASK_0000FF00, MASK_NOT_USED, 2, CALL_RR,  RC, 0, RC,  0,  N,  0, asm_rv32_opcode_cand      },
-    { MP_QSTR_c_andi,     MASK_0000FF00, MASK_0000003F, MASK_NOT_USED, 2, CALL_RI,  RC, 0, I,   0,  N,  0, asm_rv32_opcode_candi     },
-    { MP_QSTR_c_beqz,     MASK_0000FF00, MASK_000001FE, MASK_NOT_USED, 2, CALL_RL,  RC, 0, L,   0,  N,  0, asm_rv32_opcode_cbeqz     },
-    { MP_QSTR_c_bnez,     MASK_0000FF00, MASK_000001FE, MASK_NOT_USED, 2, CALL_RL,  RC, 0, L,   0,  N,  0, asm_rv32_opcode_cbnez     },
-    { MP_QSTR_c_ebreak,   MASK_NOT_USED, MASK_NOT_USED, MASK_NOT_USED, 0, CALL_N,   N,  0, N,   0,  N,  0, asm_rv32_opcode_cebreak   },
-    { MP_QSTR_c_j,        MASK_00000FFE, MASK_NOT_USED, MASK_NOT_USED, 1, CALL_L,   L,  0, N,   0,  N,  0, asm_rv32_opcode_cj        },
-    { MP_QSTR_c_jal,      MASK_00000FFE, MASK_NOT_USED, MASK_NOT_USED, 1, CALL_L,   L,  0, N,   0,  N,  0, asm_rv32_opcode_cjal      },
-    { MP_QSTR_c_jalr,     MASK_FFFFFFFE, MASK_NOT_USED, MASK_NOT_USED, 1, CALL_R,   R,  0, N,   0,  N,  0, asm_rv32_opcode_cjalr     },
-    { MP_QSTR_c_jr,       MASK_FFFFFFFE, MASK_NOT_USED, MASK_NOT_USED, 1, CALL_R,   R,  0, N,   0,  N,  0, asm_rv32_opcode_cjr       },
-    { MP_QSTR_c_li,       MASK_FFFFFFFE, MASK_0000003F, MASK_NOT_USED, 2, CALL_RI,  R,  0, I,   0,  N,  0, asm_rv32_opcode_cli       },
-    { MP_QSTR_c_lui,      MASK_FFFFFFFA, MASK_0001F800, MASK_NOT_USED, 2, CALL_RI,  R,  0, IUZ, 12, N,  0, asm_rv32_opcode_clui      },
-    { MP_QSTR_c_lw,       MASK_0000FF00, MASK_0000007C, MASK_0000FF00, 3, CALL_RIR, RC, 0, I,   0,  RC, 0, asm_rv32_opcode_clw       },
-    { MP_QSTR_c_lwsp,     MASK_FFFFFFFE, MASK_000000FC, MASK_NOT_USED, 2, CALL_RI,  R,  0, I,   0,  N,  0, asm_rv32_opcode_clwsp     },
-    { MP_QSTR_c_mv,       MASK_FFFFFFFE, MASK_FFFFFFFE, MASK_NOT_USED, 2, CALL_RR,  R,  0, R,   0,  N,  0, asm_rv32_opcode_cmv       },
-    { MP_QSTR_c_nop,      MASK_NOT_USED, MASK_NOT_USED, MASK_NOT_USED, 0, CALL_N,   N,  0, N,   0,  N,  0, asm_rv32_opcode_cnop      },
-    { MP_QSTR_c_or,       MASK_0000FF00, MASK_0000FF00, MASK_NOT_USED, 2, CALL_RR,  RC, 0, RC,  0,  N,  0, asm_rv32_opcode_cor       },
-    { MP_QSTR_c_slli,     MASK_FFFFFFFE, MASK_0000001F, MASK_NOT_USED, 2, CALL_RI,  R,  0, IU,  0,  N,  0, asm_rv32_opcode_cslli     },
-    { MP_QSTR_c_srai,     MASK_0000FF00, MASK_0000001F, MASK_NOT_USED, 2, CALL_RI,  RC, 0, IU,  0,  N,  0, asm_rv32_opcode_csrai     },
-    { MP_QSTR_c_srli,     MASK_0000FF00, MASK_0000001F, MASK_NOT_USED, 2, CALL_RI,  RC, 0, IU,  0,  N,  0, asm_rv32_opcode_csrli     },
-    { MP_QSTR_c_sub,      MASK_0000FF00, MASK_0000FF00, MASK_NOT_USED, 2, CALL_RR,  RC, 0, RC,  0,  N,  0, asm_rv32_opcode_csub      },
-    { MP_QSTR_c_sw,       MASK_0000FF00, MASK_0000007C, MASK_0000FF00, 3, CALL_RIR, RC, 0, I,   0,  RC, 0, asm_rv32_opcode_csw       },
-    { MP_QSTR_c_swsp,     MASK_FFFFFFFF, MASK_000000FC, MASK_NOT_USED, 2, CALL_RI,  R,  0, I,   0,  N,  0, asm_rv32_opcode_cswsp     },
-    { MP_QSTR_c_xor,      MASK_0000FF00, MASK_0000FF00, MASK_NOT_USED, 2, CALL_RR,  RC, 0, RC,  0,  N,  0, asm_rv32_opcode_cxor      },
-    { MP_QSTR_div,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, asm_rv32_opcode_div       },
-    { MP_QSTR_divu,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, asm_rv32_opcode_divu      },
-    { MP_QSTR_ebreak,     MASK_NOT_USED, MASK_NOT_USED, MASK_NOT_USED, 0, CALL_N,   N,  0, N,   0,  N,  0, asm_rv32_opcode_ebreak    },
-    { MP_QSTR_ecall,      MASK_NOT_USED, MASK_NOT_USED, MASK_NOT_USED, 0, CALL_N,   N,  0, N,   0,  N,  0, asm_rv32_opcode_ecall     },
-    { MP_QSTR_jal,        MASK_FFFFFFFF, MASK_001FFFFE, MASK_NOT_USED, 2, CALL_RL,  R,  0, L,   0,  N,  0, asm_rv32_opcode_jal       },
-    { MP_QSTR_jalr,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00000FFF, 3, CALL_RRI, R,  0, R,   0,  I,  0, asm_rv32_opcode_jalr      },
-    { MP_QSTR_la,         MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_NOT_USED, 2, CALL_RL,  R,  0, L,   0,  N,  0, opcode_la                 },
-    { MP_QSTR_lb,         MASK_FFFFFFFF, MASK_00000FFF, MASK_FFFFFFFF, 3, CALL_RIR, R,  0, I,   0,  R,  0, asm_rv32_opcode_lb        },
-    { MP_QSTR_lbu,        MASK_FFFFFFFF, MASK_00000FFF, MASK_FFFFFFFF, 3, CALL_RIR, R,  0, I,   0,  R,  0, asm_rv32_opcode_lbu       },
-    { MP_QSTR_lh,         MASK_FFFFFFFF, MASK_00000FFF, MASK_FFFFFFFF, 3, CALL_RIR, R,  0, I,   0,  R,  0, asm_rv32_opcode_lh        },
-    { MP_QSTR_lhu,        MASK_FFFFFFFF, MASK_00000FFF, MASK_FFFFFFFF, 3, CALL_RIR, R,  0, I,   0,  R,  0, asm_rv32_opcode_lhu       },
-    { MP_QSTR_li,         MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_NOT_USED, 2, CALL_RI,  R,  0, I,   0,  N,  0, opcode_li                 },
-    { MP_QSTR_lui,        MASK_FFFFFFFF, MASK_FFFFF000, MASK_NOT_USED, 2, CALL_RI,  R,  0, I,   12, N,  0, asm_rv32_opcode_lui       },
-    { MP_QSTR_lw,         MASK_FFFFFFFF, MASK_00000FFF, MASK_FFFFFFFF, 3, CALL_RIR, R,  0, I,   0,  R,  0, asm_rv32_opcode_lw        },
-    { MP_QSTR_mv,         MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_NOT_USED, 2, CALL_RR,  R,  0, R,   0,  N,  0, asm_rv32_opcode_cmv       },
-    { MP_QSTR_mul,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, asm_rv32_opcode_mul       },
-    { MP_QSTR_mulh,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, asm_rv32_opcode_mulh      },
-    { MP_QSTR_mulhsu,     MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, asm_rv32_opcode_mulhsu    },
-    { MP_QSTR_mulhu,      MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, asm_rv32_opcode_mulhu     },
-    { MP_QSTR_or_,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, asm_rv32_opcode_or        },
-    { MP_QSTR_ori,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00000FFF, 3, CALL_RRI, R,  0, R,   0,  I,  0, asm_rv32_opcode_ori       },
-    { MP_QSTR_rem,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, asm_rv32_opcode_rem       },
-    { MP_QSTR_remu,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, asm_rv32_opcode_remu      },
-    { MP_QSTR_sb,         MASK_FFFFFFFF, MASK_00000FFF, MASK_FFFFFFFF, 3, CALL_RIR, R,  0, I,   0,  R,  0, asm_rv32_opcode_sb        },
-    { MP_QSTR_sh,         MASK_FFFFFFFF, MASK_00000FFF, MASK_FFFFFFFF, 3, CALL_RIR, R,  0, I,   0,  R,  0, asm_rv32_opcode_sh        },
-    { MP_QSTR_sll,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, asm_rv32_opcode_sll       },
-    { MP_QSTR_slli,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_0000001F, 3, CALL_RRI, R,  0, R,   0,  IU, 0, asm_rv32_opcode_slli      },
-    { MP_QSTR_slt,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, asm_rv32_opcode_slt       },
-    { MP_QSTR_slti,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00000FFF, 3, CALL_RRI, R,  0, R,   0,  I,  0, asm_rv32_opcode_slti      },
-    { MP_QSTR_sltiu,      MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00000FFF, 3, CALL_RRI, R,  0, R,   0,  I,  0, asm_rv32_opcode_sltiu     },
-    { MP_QSTR_sltu,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, asm_rv32_opcode_sltu      },
-    { MP_QSTR_sra,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, asm_rv32_opcode_sra       },
-    { MP_QSTR_srai,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_0000001F, 3, CALL_RRI, R,  0, R,   0,  IU, 0, asm_rv32_opcode_srai      },
-    { MP_QSTR_srl,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, asm_rv32_opcode_srl       },
-    { MP_QSTR_srli,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_0000001F, 3, CALL_RRI, R,  0, R,   0,  IU, 0, asm_rv32_opcode_srli      },
-    { MP_QSTR_sub,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, asm_rv32_opcode_sub       },
-    { MP_QSTR_sw,         MASK_FFFFFFFF, MASK_00000FFF, MASK_FFFFFFFF, 3, CALL_RIR, R,  0, I,   0,  R,  0, asm_rv32_opcode_sw        },
-    { MP_QSTR_xor,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, asm_rv32_opcode_xor       },
-    { MP_QSTR_xori,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00000FFF, 3, CALL_RRI, R,  0, R,   0,  I,  0, asm_rv32_opcode_xori      },
+    { MP_QSTR_add,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_add       },
+    { MP_QSTR_addi,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00000FFF, 3, CALL_RRI, R,  0, R,   0,  I,  0, RV32_EXT_NONE, asm_rv32_opcode_addi      },
+    { MP_QSTR_and_,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_and       },
+    { MP_QSTR_andi,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00000FFF, 3, CALL_RRI, R,  0, R,   0,  I,  0, RV32_EXT_NONE, asm_rv32_opcode_andi      },
+    { MP_QSTR_auipc,      MASK_FFFFFFFF, MASK_FFFFF000, MASK_NOT_USED, 2, CALL_RI,  R,  0, I,   12, N,  0, RV32_EXT_NONE, asm_rv32_opcode_auipc     },
+    { MP_QSTR_beq,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00001FFE, 3, CALL_RRL, R,  0, R,   0,  L,  0, RV32_EXT_NONE, asm_rv32_opcode_beq       },
+    { MP_QSTR_bge,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00001FFE, 3, CALL_RRL, R,  0, R,   0,  L,  0, RV32_EXT_NONE, asm_rv32_opcode_bge       },
+    { MP_QSTR_bgeu,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00001FFE, 3, CALL_RRL, R,  0, R,   0,  L,  0, RV32_EXT_NONE, asm_rv32_opcode_bgeu      },
+    { MP_QSTR_blt,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00001FFE, 3, CALL_RRL, R,  0, R,   0,  L,  0, RV32_EXT_NONE, asm_rv32_opcode_blt       },
+    { MP_QSTR_bltu,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00001FFE, 3, CALL_RRL, R,  0, R,   0,  L,  0, RV32_EXT_NONE, asm_rv32_opcode_bltu      },
+    { MP_QSTR_bne,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00001FFE, 3, CALL_RRL, R,  0, R,   0,  L,  0, RV32_EXT_NONE, asm_rv32_opcode_bne       },
+    { MP_QSTR_csrrc,      MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00000FFF, 3, CALL_RRI, R,  0, R,   0,  IU, 0, RV32_EXT_NONE, asm_rv32_opcode_csrrc     },
+    { MP_QSTR_csrrs,      MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00000FFF, 3, CALL_RRI, R,  0, R,   0,  IU, 0, RV32_EXT_NONE, asm_rv32_opcode_csrrs     },
+    { MP_QSTR_csrrw,      MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00000FFF, 3, CALL_RRI, R,  0, R,   0,  IU, 0, RV32_EXT_NONE, asm_rv32_opcode_csrrw     },
+    { MP_QSTR_csrrci,     MASK_FFFFFFFF, MASK_00000FFF, MASK_0000001F, 3, CALL_RII, R,  0, IU,  0,  IU, 0, RV32_EXT_NONE, asm_rv32_opcode_csrrci    },
+    { MP_QSTR_csrrsi,     MASK_FFFFFFFF, MASK_00000FFF, MASK_0000001F, 3, CALL_RII, R,  0, IU,  0,  IU, 0, RV32_EXT_NONE, asm_rv32_opcode_csrrsi    },
+    { MP_QSTR_csrrwi,     MASK_FFFFFFFF, MASK_00000FFF, MASK_0000001F, 3, CALL_RII, R,  0, IU,  0,  IU, 0, RV32_EXT_NONE, asm_rv32_opcode_csrrwi    },
+    { MP_QSTR_c_add,      MASK_FFFFFFFE, MASK_FFFFFFFE, MASK_NOT_USED, 2, CALL_RR,  R,  0, R,   0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_cadd      },
+    { MP_QSTR_c_addi,     MASK_FFFFFFFE, MASK_0000003F, MASK_NOT_USED, 2, CALL_RI,  R,  0, IZ,  0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_caddi     },
+    { MP_QSTR_c_addi4spn, MASK_0000FF00, MASK_000003FC, MASK_NOT_USED, 2, CALL_RI,  R,  0, IUZ, 0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_caddi4spn },
+    { MP_QSTR_c_and,      MASK_0000FF00, MASK_0000FF00, MASK_NOT_USED, 2, CALL_RR,  RC, 0, RC,  0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_cand      },
+    { MP_QSTR_c_andi,     MASK_0000FF00, MASK_0000003F, MASK_NOT_USED, 2, CALL_RI,  RC, 0, I,   0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_candi     },
+    { MP_QSTR_c_beqz,     MASK_0000FF00, MASK_000001FE, MASK_NOT_USED, 2, CALL_RL,  RC, 0, L,   0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_cbeqz     },
+    { MP_QSTR_c_bnez,     MASK_0000FF00, MASK_000001FE, MASK_NOT_USED, 2, CALL_RL,  RC, 0, L,   0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_cbnez     },
+    { MP_QSTR_c_ebreak,   MASK_NOT_USED, MASK_NOT_USED, MASK_NOT_USED, 0, CALL_N,   N,  0, N,   0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_cebreak   },
+    { MP_QSTR_c_j,        MASK_00000FFE, MASK_NOT_USED, MASK_NOT_USED, 1, CALL_L,   L,  0, N,   0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_cj        },
+    { MP_QSTR_c_jal,      MASK_00000FFE, MASK_NOT_USED, MASK_NOT_USED, 1, CALL_L,   L,  0, N,   0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_cjal      },
+    { MP_QSTR_c_jalr,     MASK_FFFFFFFE, MASK_NOT_USED, MASK_NOT_USED, 1, CALL_R,   R,  0, N,   0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_cjalr     },
+    { MP_QSTR_c_jr,       MASK_FFFFFFFE, MASK_NOT_USED, MASK_NOT_USED, 1, CALL_R,   R,  0, N,   0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_cjr       },
+    { MP_QSTR_c_li,       MASK_FFFFFFFE, MASK_0000003F, MASK_NOT_USED, 2, CALL_RI,  R,  0, I,   0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_cli       },
+    { MP_QSTR_c_lui,      MASK_FFFFFFFA, MASK_0001F800, MASK_NOT_USED, 2, CALL_RI,  R,  0, IUZ, 12, N,  0, RV32_EXT_NONE, asm_rv32_opcode_clui      },
+    { MP_QSTR_c_lw,       MASK_0000FF00, MASK_0000007C, MASK_0000FF00, 2, CALL_RIR, RC, 0, I,   0,  RC, 0, RV32_EXT_NONE, asm_rv32_opcode_clw       },
+    { MP_QSTR_c_lwsp,     MASK_FFFFFFFE, MASK_000000FC, MASK_NOT_USED, 2, CALL_RI,  R,  0, I,   0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_clwsp     },
+    { MP_QSTR_c_mv,       MASK_FFFFFFFE, MASK_FFFFFFFE, MASK_NOT_USED, 2, CALL_RR,  R,  0, R,   0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_cmv       },
+    { MP_QSTR_c_nop,      MASK_NOT_USED, MASK_NOT_USED, MASK_NOT_USED, 0, CALL_N,   N,  0, N,   0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_cnop      },
+    { MP_QSTR_c_or,       MASK_0000FF00, MASK_0000FF00, MASK_NOT_USED, 2, CALL_RR,  RC, 0, RC,  0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_cor       },
+    { MP_QSTR_c_slli,     MASK_FFFFFFFE, MASK_0000001F, MASK_NOT_USED, 2, CALL_RI,  R,  0, IU,  0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_cslli     },
+    { MP_QSTR_c_srai,     MASK_0000FF00, MASK_0000001F, MASK_NOT_USED, 2, CALL_RI,  RC, 0, IU,  0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_csrai     },
+    { MP_QSTR_c_srli,     MASK_0000FF00, MASK_0000001F, MASK_NOT_USED, 2, CALL_RI,  RC, 0, IU,  0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_csrli     },
+    { MP_QSTR_c_sub,      MASK_0000FF00, MASK_0000FF00, MASK_NOT_USED, 2, CALL_RR,  RC, 0, RC,  0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_csub      },
+    { MP_QSTR_c_sw,       MASK_0000FF00, MASK_0000007C, MASK_0000FF00, 2, CALL_RIR, RC, 0, I,   0,  RC, 0, RV32_EXT_NONE, asm_rv32_opcode_csw       },
+    { MP_QSTR_c_swsp,     MASK_FFFFFFFF, MASK_000000FC, MASK_NOT_USED, 2, CALL_RI,  R,  0, I,   0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_cswsp     },
+    { MP_QSTR_c_xor,      MASK_0000FF00, MASK_0000FF00, MASK_NOT_USED, 2, CALL_RR,  RC, 0, RC,  0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_cxor      },
+    { MP_QSTR_div,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_div       },
+    { MP_QSTR_divu,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_divu      },
+    { MP_QSTR_ebreak,     MASK_NOT_USED, MASK_NOT_USED, MASK_NOT_USED, 0, CALL_N,   N,  0, N,   0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_ebreak    },
+    { MP_QSTR_ecall,      MASK_NOT_USED, MASK_NOT_USED, MASK_NOT_USED, 0, CALL_N,   N,  0, N,   0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_ecall     },
+    { MP_QSTR_jal,        MASK_FFFFFFFF, MASK_001FFFFE, MASK_NOT_USED, 2, CALL_RL,  R,  0, L,   0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_jal       },
+    { MP_QSTR_jalr,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00000FFF, 3, CALL_RRI, R,  0, R,   0,  I,  0, RV32_EXT_NONE, asm_rv32_opcode_jalr      },
+    { MP_QSTR_la,         MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_NOT_USED, 2, CALL_RL,  R,  0, L,   0,  N,  0, RV32_EXT_NONE, opcode_la                 },
+    { MP_QSTR_lb,         MASK_FFFFFFFF, MASK_00000FFF, MASK_FFFFFFFF, 2, CALL_RIR, R,  0, I,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_lb        },
+    { MP_QSTR_lbu,        MASK_FFFFFFFF, MASK_00000FFF, MASK_FFFFFFFF, 2, CALL_RIR, R,  0, I,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_lbu       },
+    { MP_QSTR_lh,         MASK_FFFFFFFF, MASK_00000FFF, MASK_FFFFFFFF, 2, CALL_RIR, R,  0, I,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_lh        },
+    { MP_QSTR_lhu,        MASK_FFFFFFFF, MASK_00000FFF, MASK_FFFFFFFF, 2, CALL_RIR, R,  0, I,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_lhu       },
+    { MP_QSTR_li,         MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_NOT_USED, 2, CALL_RI,  R,  0, I,   0,  N,  0, RV32_EXT_NONE, opcode_li                 },
+    { MP_QSTR_lui,        MASK_FFFFFFFF, MASK_FFFFF000, MASK_NOT_USED, 2, CALL_RI,  R,  0, I,   12, N,  0, RV32_EXT_NONE, asm_rv32_opcode_lui       },
+    { MP_QSTR_lw,         MASK_FFFFFFFF, MASK_00000FFF, MASK_FFFFFFFF, 2, CALL_RIR, R,  0, I,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_lw        },
+    { MP_QSTR_mv,         MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_NOT_USED, 2, CALL_RR,  R,  0, R,   0,  N,  0, RV32_EXT_NONE, asm_rv32_opcode_cmv       },
+    { MP_QSTR_mul,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_mul       },
+    { MP_QSTR_mulh,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_mulh      },
+    { MP_QSTR_mulhsu,     MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_mulhsu    },
+    { MP_QSTR_mulhu,      MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_mulhu     },
+    { MP_QSTR_or_,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_or        },
+    { MP_QSTR_ori,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00000FFF, 3, CALL_RRI, R,  0, R,   0,  I,  0, RV32_EXT_NONE, asm_rv32_opcode_ori       },
+    { MP_QSTR_rem,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_rem       },
+    { MP_QSTR_remu,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_remu      },
+    { MP_QSTR_sb,         MASK_FFFFFFFF, MASK_00000FFF, MASK_FFFFFFFF, 2, CALL_RIR, R,  0, I,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_sb        },
+    { MP_QSTR_sh,         MASK_FFFFFFFF, MASK_00000FFF, MASK_FFFFFFFF, 2, CALL_RIR, R,  0, I,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_sh        },
+    { MP_QSTR_sh1add,     MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, RV32_EXT_ZBA,  asm_rv32_opcode_sh1add    },
+    { MP_QSTR_sh2add,     MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, RV32_EXT_ZBA,  asm_rv32_opcode_sh2add    },
+    { MP_QSTR_sh3add,     MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, RV32_EXT_ZBA,  asm_rv32_opcode_sh3add    },
+    { MP_QSTR_sll,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_sll       },
+    { MP_QSTR_slli,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_0000001F, 3, CALL_RRI, R,  0, R,   0,  IU, 0, RV32_EXT_NONE, asm_rv32_opcode_slli      },
+    { MP_QSTR_slt,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_slt       },
+    { MP_QSTR_slti,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00000FFF, 3, CALL_RRI, R,  0, R,   0,  I,  0, RV32_EXT_NONE, asm_rv32_opcode_slti      },
+    { MP_QSTR_sltiu,      MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00000FFF, 3, CALL_RRI, R,  0, R,   0,  I,  0, RV32_EXT_NONE, asm_rv32_opcode_sltiu     },
+    { MP_QSTR_sltu,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_sltu      },
+    { MP_QSTR_sra,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_sra       },
+    { MP_QSTR_srai,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_0000001F, 3, CALL_RRI, R,  0, R,   0,  IU, 0, RV32_EXT_NONE, asm_rv32_opcode_srai      },
+    { MP_QSTR_srl,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_srl       },
+    { MP_QSTR_srli,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_0000001F, 3, CALL_RRI, R,  0, R,   0,  IU, 0, RV32_EXT_NONE, asm_rv32_opcode_srli      },
+    { MP_QSTR_sub,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_sub       },
+    { MP_QSTR_sw,         MASK_FFFFFFFF, MASK_00000FFF, MASK_FFFFFFFF, 2, CALL_RIR, R,  0, I,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_sw        },
+    { MP_QSTR_xor,        MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_FFFFFFFF, 3, CALL_RRR, R,  0, R,   0,  R,  0, RV32_EXT_NONE, asm_rv32_opcode_xor       },
+    { MP_QSTR_xori,       MASK_FFFFFFFF, MASK_FFFFFFFF, MASK_00000FFF, 3, CALL_RRI, R,  0, R,   0,  I,  0, RV32_EXT_NONE, asm_rv32_opcode_xori      },
 };
 
 #undef RC
@@ -388,9 +391,9 @@ static const opcode_t OPCODES[] = {
 
 // These two checks assume the bitmasks are contiguous.
 
-static bool is_in_signed_mask(mp_uint_t mask, mp_uint_t value) {
-    mp_uint_t leading_zeroes = mp_clz(mask);
-    if (leading_zeroes == 0 || leading_zeroes > 32) {
+static bool is_in_signed_mask(uint32_t mask, mp_uint_t value) {
+    uint32_t leading_zeroes = mp_clz(mask);
+    if (leading_zeroes == 0) {
         return true;
     }
     mp_uint_t positive_mask = ~(mask & ~(1U << (31 - leading_zeroes)));
@@ -435,9 +438,9 @@ static bool validate_integer(mp_uint_t value, mp_uint_t mask, mp_uint_t flags) {
 #define ET_WRONG_ARGUMENTS_COUNT MP_ERROR_TEXT("opcode '%q': expecting %d arguments")
 #define ET_OUT_OF_RANGE          MP_ERROR_TEXT("opcode '%q' argument %d: out of range")
 
-static bool validate_argument(emit_inline_asm_t *emit, qstr opcode_qstr,
-    const opcode_t *opcode, mp_parse_node_t node, mp_uint_t node_index) {
+static bool serialise_argument(emit_inline_asm_t *emit, const opcode_t *opcode, mp_parse_node_t node, mp_uint_t node_index, mp_uint_t *serialised) {
     assert((node_index < 3) && "Invalid argument node number.");
+    assert(serialised && "Serialised value pointer is NULL.");
 
     uint32_t kind = 0;
     uint32_t shift = 0;
@@ -466,17 +469,19 @@ static bool validate_argument(emit_inline_asm_t *emit, qstr opcode_qstr,
             break;
     }
 
+    mp_uint_t serialised_value = 0;
+
     switch (kind & 0x03) {
         case N:
             assert(mask == OPCODE_MASKS[MASK_NOT_USED] && "Invalid mask index for missing operand.");
-            return true;
+            break;
 
         case R: {
             mp_uint_t register_index;
             if (!parse_register_node(node, &register_index, false)) {
                 emit_inline_rv32_error_exc(emit,
                     mp_obj_new_exception_msg_varg(&mp_type_SyntaxError,
-                        ET_WRONG_ARGUMENT_KIND, opcode_qstr, node_index + 1, MP_QSTR_register));
+                        ET_WRONG_ARGUMENT_KIND, opcode->qstring, node_index + 1, MP_QSTR_register));
                 return false;
             }
 
@@ -484,11 +489,11 @@ static bool validate_argument(emit_inline_asm_t *emit, qstr opcode_qstr,
                 emit_inline_rv32_error_exc(emit,
                     mp_obj_new_exception_msg_varg(&mp_type_SyntaxError,
                         MP_ERROR_TEXT("opcode '%q' argument %d: unknown register"),
-                        opcode_qstr, node_index + 1));
+                        opcode->qstring, node_index + 1));
                 return false;
             }
 
-            return true;
+            serialised_value = (kind & C) ? RV32_MAP_IN_C_REGISTER_WINDOW(register_index) : register_index;
         }
         break;
 
@@ -497,11 +502,11 @@ static bool validate_argument(emit_inline_asm_t *emit, qstr opcode_qstr,
             if (!mp_parse_node_get_int_maybe(node, &object)) {
                 emit_inline_rv32_error_exc(emit,
                     mp_obj_new_exception_msg_varg(&mp_type_SyntaxError,
-                        ET_WRONG_ARGUMENT_KIND, opcode_qstr, node_index + 1, MP_QSTR_integer));
+                        ET_WRONG_ARGUMENT_KIND, opcode->qstring, node_index + 1, MP_QSTR_integer));
                 return false;
             }
 
-            mp_uint_t immediate = mp_obj_get_int_truncated(object) << shift;
+            mp_uint_t immediate = ((mp_uint_t)mp_obj_get_int_truncated(object)) << shift;
             if (kind & U) {
                 if (!is_in_unsigned_mask(mask, immediate)) {
                     goto out_of_range;
@@ -516,7 +521,7 @@ static bool validate_argument(emit_inline_asm_t *emit, qstr opcode_qstr,
                 goto zero_immediate;
             }
 
-            return true;
+            serialised_value = immediate;
         }
         break;
 
@@ -524,7 +529,7 @@ static bool validate_argument(emit_inline_asm_t *emit, qstr opcode_qstr,
             if (!MP_PARSE_NODE_IS_ID(node)) {
                 emit_inline_rv32_error_exc(emit,
                     mp_obj_new_exception_msg_varg(&mp_type_SyntaxError,
-                        ET_WRONG_ARGUMENT_KIND, opcode_qstr, node_index + 1, MP_QSTR_label));
+                        ET_WRONG_ARGUMENT_KIND, opcode->qstring, node_index + 1, MP_QSTR_label));
                 return false;
             }
 
@@ -534,7 +539,7 @@ static bool validate_argument(emit_inline_asm_t *emit, qstr opcode_qstr,
                 emit_inline_rv32_error_exc(emit,
                     mp_obj_new_exception_msg_varg(&mp_type_SyntaxError,
                         MP_ERROR_TEXT("opcode '%q' argument %d: undefined label '%q'"),
-                        opcode_qstr, node_index + 1, qstring));
+                        opcode->qstring, node_index + 1, qstring));
                 return false;
             }
 
@@ -548,43 +553,45 @@ static bool validate_argument(emit_inline_asm_t *emit, qstr opcode_qstr,
                     goto out_of_range;
                 }
             }
-            return true;
+
+            serialised_value = displacement;
         }
         break;
 
         default:
             assert(!"Unknown argument kind");
+            MP_UNREACHABLE;
             break;
     }
 
-    return false;
+    *serialised = serialised_value;
+    return true;
 
 out_of_range:
     emit_inline_rv32_error_exc(emit,
-        mp_obj_new_exception_msg_varg(&mp_type_SyntaxError, ET_OUT_OF_RANGE, opcode_qstr, node_index + 1));
+        mp_obj_new_exception_msg_varg(&mp_type_SyntaxError, ET_OUT_OF_RANGE, opcode->qstring, node_index + 1));
     return false;
 
 zero_immediate:
     emit_inline_rv32_error_exc(emit,
         mp_obj_new_exception_msg_varg(&mp_type_SyntaxError,
             MP_ERROR_TEXT("opcode '%q' argument %d: must not be zero"),
-            opcode_qstr, node_index + 1));
+            opcode->qstring, node_index + 1));
     return false;
 }
 
-static bool parse_register_offset_node(emit_inline_asm_t *emit, qstr opcode_qstr, const opcode_t *opcode_data, mp_parse_node_t node, mp_uint_t node_index, mp_parse_node_t *register_node, mp_parse_node_t *offset_node, bool *negative) {
-    assert(register_node != NULL && "Register node pointer is NULL.");
-    assert(offset_node != NULL && "Offset node pointer is NULL.");
-    assert(negative != NULL && "Negative pointer is NULL.");
+static bool serialise_register_offset_node(emit_inline_asm_t *emit, const opcode_t *opcode_data, mp_parse_node_t node, mp_uint_t node_index, mp_uint_t *offset, mp_uint_t *base) {
+    assert(offset && "Attempting to store the offset value into NULL.");
+    assert(base && "Attempting to store the base register into NULL.");
 
     if (!MP_PARSE_NODE_IS_STRUCT_KIND(node, PN_atom_expr_normal) && !MP_PARSE_NODE_IS_STRUCT_KIND(node, PN_factor_2)) {
         goto invalid_structure;
     }
     mp_parse_node_struct_t *node_struct = (mp_parse_node_struct_t *)node;
-    *negative = false;
+    bool negative = false;
     if (MP_PARSE_NODE_IS_STRUCT_KIND(node, PN_factor_2)) {
         if (MP_PARSE_NODE_IS_TOKEN_KIND(node_struct->nodes[0], MP_TOKEN_OP_MINUS)) {
-            *negative = true;
+            negative = true;
         } else {
             if (!MP_PARSE_NODE_IS_TOKEN_KIND(node_struct->nodes[0], MP_TOKEN_OP_PLUS)) {
                 goto invalid_structure;
@@ -596,184 +603,281 @@ static bool parse_register_offset_node(emit_inline_asm_t *emit, qstr opcode_qstr
         node_struct = (mp_parse_node_struct_t *)node_struct->nodes[1];
     }
 
-    if (*negative) {
+    if (negative) {
         // If the value is negative, RULE_atom_expr_normal's first token will be the
         // offset stripped of its negative marker; range check will then fail if the
         // default method is used, so a custom check is used instead.
         mp_obj_t object;
         if (!mp_parse_node_get_int_maybe(node_struct->nodes[0], &object)) {
             emit_inline_rv32_error_exc(emit,
-                mp_obj_new_exception_msg_varg(&mp_type_SyntaxError, ET_WRONG_ARGUMENT_KIND, opcode_qstr, 2, MP_QSTR_integer));
+                mp_obj_new_exception_msg_varg(&mp_type_SyntaxError, ET_WRONG_ARGUMENT_KIND, opcode_data->qstring, 2, MP_QSTR_integer));
             return false;
         }
         mp_uint_t value = mp_obj_get_int_truncated(object);
         value = (~value + 1) & (mp_uint_t)-1;
         if (!validate_integer(value << opcode_data->argument2_shift, OPCODE_MASKS[opcode_data->argument2_mask], opcode_data->argument2_kind)) {
             emit_inline_rv32_error_exc(emit,
-                mp_obj_new_exception_msg_varg(&mp_type_SyntaxError, ET_OUT_OF_RANGE, opcode_qstr, 2));
+                mp_obj_new_exception_msg_varg(&mp_type_SyntaxError, ET_OUT_OF_RANGE, opcode_data->qstring, 2));
             return false;
         }
+        *offset = value;
     } else {
-        if (!validate_argument(emit, opcode_qstr, opcode_data, node_struct->nodes[0], 1)) {
+        if (!serialise_argument(emit, opcode_data, node_struct->nodes[0], 1, offset)) {
             return false;
         }
     }
 
-    *offset_node = node_struct->nodes[0];
     node_struct = (mp_parse_node_struct_t *)node_struct->nodes[1];
-    if (!validate_argument(emit, opcode_qstr, opcode_data, node_struct->nodes[0], 2)) {
+    if (!serialise_argument(emit, opcode_data, node_struct->nodes[0], 2, base)) {
         return false;
     }
-    *register_node = node_struct->nodes[0];
     return true;
 
 invalid_structure:
     emit_inline_rv32_error_exc(emit,
         mp_obj_new_exception_msg_varg(&mp_type_SyntaxError,
-            ET_WRONG_ARGUMENT_KIND, opcode_qstr, node_index + 1, MP_QSTR_offset));
+            ET_WRONG_ARGUMENT_KIND, opcode_data->qstring, node_index + 1, MP_QSTR_offset));
     return false;
 }
 
-static void handle_opcode(emit_inline_asm_t *emit, qstr opcode, const opcode_t *opcode_data, mp_parse_node_t *arguments) {
-    mp_uint_t rd = 0;
-    mp_uint_t rs1 = 0;
-    mp_uint_t rs2 = 0;
-
+static void handle_opcode(emit_inline_asm_t *emit, const opcode_t *opcode_data, mp_uint_t *arguments) {
     switch (opcode_data->calling_convention) {
-        case CALL_RRR: {
-            parse_register_node(arguments[0], &rd, opcode_data->argument1_kind & C);
-            parse_register_node(arguments[1], &rs1, opcode_data->argument2_kind & C);
-            parse_register_node(arguments[2], &rs2, opcode_data->argument3_kind & C);
-            ((call_rrr_t)opcode_data->emitter)(&emit->as, rd, rs1, rs2);
+        case CALL_RRR:
+            ((call_rrr_t)opcode_data->emitter)(&emit->as, arguments[0], arguments[1], arguments[2]);
             break;
-        }
 
-        case CALL_RR: {
-            parse_register_node(arguments[0], &rd, opcode_data->argument1_kind & C);
-            parse_register_node(arguments[1], &rs1, opcode_data->argument2_kind & C);
-            ((call_rr_t)opcode_data->emitter)(&emit->as, rd, rs1);
+        case CALL_RR:
+            ((call_rr_t)opcode_data->emitter)(&emit->as, arguments[0], arguments[1]);
             break;
-        }
 
-        case CALL_RRI: {
-            parse_register_node(arguments[0], &rd, opcode_data->argument1_kind & C);
-            parse_register_node(arguments[1], &rs1, opcode_data->argument2_kind & C);
-            mp_obj_t object;
-            mp_parse_node_get_int_maybe(arguments[2], &object);
-            mp_uint_t immediate = mp_obj_get_int_truncated(object) << opcode_data->argument3_shift;
-            ((call_rri_t)opcode_data->emitter)(&emit->as, rd, rs1, immediate);
+        case CALL_RRI:
+            ((call_rri_t)opcode_data->emitter)(&emit->as, arguments[0], arguments[1], arguments[2]);
             break;
-        }
 
-        case CALL_RI: {
-            parse_register_node(arguments[0], &rd, opcode_data->argument1_kind & C);
-            mp_obj_t object;
-            mp_parse_node_get_int_maybe(arguments[1], &object);
-            mp_uint_t immediate = mp_obj_get_int_truncated(object) << opcode_data->argument2_shift;
-            ((call_ri_t)opcode_data->emitter)(&emit->as, rd, immediate);
+        case CALL_RI:
+            ((call_ri_t)opcode_data->emitter)(&emit->as, arguments[0], arguments[1]);
             break;
-        }
 
-        case CALL_R: {
-            parse_register_node(arguments[0], &rd, opcode_data->argument1_kind & C);
-            ((call_r_t)opcode_data->emitter)(&emit->as, rd);
+        case CALL_R:
+            ((call_r_t)opcode_data->emitter)(&emit->as, arguments[0]);
             break;
-        }
 
-        case CALL_RRL: {
-            parse_register_node(arguments[0], &rd, opcode_data->argument1_kind & C);
-            parse_register_node(arguments[1], &rs1, opcode_data->argument2_kind & C);
-            qstr qstring;
-            mp_uint_t label_index = lookup_label(emit, arguments[2], &qstring);
-            ptrdiff_t displacement = label_code_offset(emit, label_index);
-            ((call_rri_t)opcode_data->emitter)(&emit->as, rd, rs1, displacement);
+        case CALL_RRL:
+            ((call_rri_t)opcode_data->emitter)(&emit->as, arguments[0], arguments[1], (ptrdiff_t)arguments[2]);
             break;
-        }
 
-        case CALL_RL: {
-            parse_register_node(arguments[0], &rd, opcode_data->argument1_kind & C);
-            qstr qstring;
-            mp_uint_t label_index = lookup_label(emit, arguments[1], &qstring);
-            ptrdiff_t displacement = label_code_offset(emit, label_index);
-            ((call_ri_t)opcode_data->emitter)(&emit->as, rd, displacement);
+        case CALL_RL:
+            ((call_ri_t)opcode_data->emitter)(&emit->as, arguments[0], (ptrdiff_t)arguments[1]);
             break;
-        }
 
-        case CALL_L: {
-            qstr qstring;
-            mp_uint_t label_index = lookup_label(emit, arguments[0], &qstring);
-            ptrdiff_t displacement = label_code_offset(emit, label_index);
-            ((call_i_t)opcode_data->emitter)(&emit->as, displacement);
+        case CALL_L:
+            ((call_i_t)opcode_data->emitter)(&emit->as, (ptrdiff_t)arguments[0]);
             break;
-        }
 
         case CALL_N:
             ((call_n_t)opcode_data->emitter)(&emit->as);
             break;
 
-        case CALL_I: {
-            mp_obj_t object;
-            mp_parse_node_get_int_maybe(arguments[0], &object);
-            mp_uint_t immediate = mp_obj_get_int_truncated(object) << opcode_data->argument1_shift;
-            ((call_i_t)opcode_data->emitter)(&emit->as, immediate);
+        case CALL_RII:
+            ((call_rii_t)opcode_data->emitter)(&emit->as, arguments[0], arguments[1], arguments[2]);
             break;
-        }
-
-        case CALL_RII: {
-            parse_register_node(arguments[0], &rd, opcode_data->argument1_kind & C);
-            mp_obj_t object;
-            mp_parse_node_get_int_maybe(arguments[1], &object);
-            mp_uint_t immediate1 = mp_obj_get_int_truncated(object) << opcode_data->argument2_shift;
-            mp_parse_node_get_int_maybe(arguments[2], &object);
-            mp_uint_t immediate2 = mp_obj_get_int_truncated(object) << opcode_data->argument3_shift;
-            ((call_rii_t)opcode_data->emitter)(&emit->as, rd, immediate1, immediate2);
-            break;
-        }
 
         case CALL_RIR:
-            assert(!"Should not get here.");
+            // The last two arguments indices are swapped on purpose.
+            ((call_rri_t)opcode_data->emitter)(&emit->as, arguments[0], arguments[2], arguments[1]);
             break;
 
         default:
             assert(!"Unhandled call convention.");
+            MP_UNREACHABLE;
             break;
     }
 }
 
-static bool handle_load_store_opcode_with_offset(emit_inline_asm_t *emit, qstr opcode, const opcode_t *opcode_data, mp_parse_node_t *argument_nodes) {
-    mp_parse_node_t nodes[3] = {0};
-    if (!validate_argument(emit, opcode, opcode_data, argument_nodes[0], 0)) {
-        return false;
-    }
-    nodes[0] = argument_nodes[0];
-    bool negative = false;
-    if (!parse_register_offset_node(emit, opcode, opcode_data, argument_nodes[1], 1, &nodes[1], &nodes[2], &negative)) {
+static bool extract_register_list(emit_inline_asm_t *emit, qstr opcode, mp_parse_node_t node, mp_uint_t *reglist) {
+    assert(reglist != NULL && "Register list pointer is NULL.");
+
+    // As per §28.9, valid register list values are as follows:
+    //
+    // {ra}, {ra, s0}, {ra, s0-s1}, {ra, s0-s2}, ..., {ra, s0-s8},
+    // {ra, s0-s9}, {ra, s0-s11}
+    //
+    // {ra, s0-s10} is *not* valid
+
+    // case 1: {ra}
+    // PN_atom_brace { ID("ra") }
+    //
+    // case 2: {ra,s0} ->
+    // PN_atom_brace { PN_dictorsetmaker { ID("ra")
+    //     PN_dictorsetmaker_list { ID("s0") } } }
+    //
+    // case 3: {ra,s0-s1} ->
+    // PN_atom_brace { PN_dictorsetmaker { ID("ra")
+    //     PN_dictorsetmaker_list { PN_arith_expr {
+    //       ID("s0") TOKEN(MP_TOKEN_OP_MINUS) ID("s1") } } } }
+
+    if (!MP_PARSE_NODE_IS_STRUCT_KIND(node, PN_atom_brace) ||
+        MP_PARSE_NODE_STRUCT_NUM_NODES((mp_parse_node_struct_t *)node) != 1) {
         return false;
     }
 
-    mp_uint_t rd = 0;
-    mp_uint_t rs1 = 0;
-    if (!parse_register_node(nodes[0], &rd, opcode_data->argument1_kind & C)) {
-        return false;
-    }
-    if (!parse_register_node(nodes[1], &rs1, opcode_data->argument3_kind & C)) {
-        return false;
+    mp_parse_node_struct_t *nodes = (mp_parse_node_struct_t *)node;
+    mp_uint_t register_id = 0;
+
+    if (MP_PARSE_NODE_IS_ID(nodes->nodes[0])) {
+        if (!parse_register_node(nodes->nodes[0], &register_id, false)) {
+            return false;
+        }
+        *reglist = 4;
+        return register_id == ASM_RV32_REG_RA;
     }
 
-    mp_obj_t object;
-    mp_parse_node_get_int_maybe(nodes[2], &object);
-    mp_uint_t immediate = mp_obj_get_int_truncated(object) << opcode_data->argument2_shift;
-    if (negative) {
-        immediate = (~immediate + 1) & (mp_uint_t)-1;
-    }
-    if (!is_in_signed_mask(OPCODE_MASKS[opcode_data->argument2_mask], immediate)) {
-        emit_inline_rv32_error_exc(emit,
-            mp_obj_new_exception_msg_varg(&mp_type_SyntaxError, ET_OUT_OF_RANGE, opcode, 2));
+    if (!MP_PARSE_NODE_IS_STRUCT_KIND(nodes->nodes[0], PN_dictorsetmaker) ||
+        MP_PARSE_NODE_STRUCT_NUM_NODES((mp_parse_node_struct_t *)nodes->nodes[0]) != 2) {
         return false;
     }
+    nodes = (mp_parse_node_struct_t *)nodes->nodes[0];
+    if (!MP_PARSE_NODE_IS_ID(nodes->nodes[0]) ||
+        !MP_PARSE_NODE_IS_STRUCT_KIND(nodes->nodes[1], PN_dictorsetmaker_list) ||
+        !parse_register_node(nodes->nodes[0], &register_id, false) ||
+        register_id != ASM_RV32_REG_RA) {
+        return false;
+    }
+    mp_parse_node_t *list_nodes;
+    size_t list_nodes_count = mp_parse_node_extract_list(&nodes->nodes[1], PN_dictorsetmaker_list2, &list_nodes);
+    if (list_nodes_count != 1 || !MP_PARSE_NODE_IS_STRUCT_KIND(list_nodes[0], PN_dictorsetmaker_list)) {
+        return false;
+    }
+    nodes = (mp_parse_node_struct_t *)list_nodes[0];
+    if (MP_PARSE_NODE_STRUCT_NUM_NODES(nodes) != 1) {
+        return false;
+    }
+    if (MP_PARSE_NODE_IS_ID(nodes->nodes[0])) {
+        if (!parse_register_node(nodes->nodes[0], &register_id, false) ||
+            register_id != ASM_RV32_REG_S0) {
+            return false;
+        }
+        *reglist = 5;
+        return true;
+    }
 
-    ((call_rri_t)opcode_data->emitter)(&emit->as, rd, rs1, immediate);
-    return true;
+    if (MP_PARSE_NODE_IS_STRUCT_KIND(nodes->nodes[0], PN_arith_expr)) {
+        nodes = (mp_parse_node_struct_t *)nodes->nodes[0];
+        if (MP_PARSE_NODE_STRUCT_NUM_NODES(nodes) != 3 ||
+            !MP_PARSE_NODE_IS_ID(nodes->nodes[0]) ||
+            !MP_PARSE_NODE_IS_TOKEN_KIND(nodes->nodes[1], MP_TOKEN_OP_MINUS) ||
+            !MP_PARSE_NODE_IS_ID(nodes->nodes[2])) {
+            return false;
+        }
+        if (!parse_register_node(nodes->nodes[0], &register_id, false) ||
+            register_id != ASM_RV32_REG_S0) {
+            return false;
+        }
+        if (!parse_register_node(nodes->nodes[2], &register_id, false) ||
+            register_id == ASM_RV32_REG_S10) {
+            return false;
+        }
+        if (register_id == ASM_RV32_REG_S1) {
+            *reglist = 6;
+            return true;
+        }
+        if (register_id >= ASM_RV32_REG_S2 && register_id <= ASM_RV32_REG_S11) {
+            *reglist = 7 + MIN(register_id, ASM_RV32_REG_S10) - ASM_RV32_REG_S2;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static const qstr_short_t ZCMP_OPCODE_NAMES[] = {
+    MP_QSTR_cm_push, MP_QSTR_cm_pop, MP_QSTR_cm_popret,
+    MP_QSTR_cm_popretz, MP_QSTR_cm_mva01s, MP_QSTR_cm_mvsa01,
+};
+
+static const void *ZCMP_OPCODE_HANDLERS[] = {
+    asm_rv32_opcode_cmpush, asm_rv32_opcode_cmpop,
+    asm_rv32_opcode_cmpopret, asm_rv32_opcode_cmpopretz,
+    asm_rv32_opcode_cmmva01s, asm_rv32_opcode_cmmvsa01,
+};
+
+typedef void (*call_xi_t)(asm_rv32_t *state, mp_uint_t register_list, mp_int_t adjustment);
+typedef void (*call_ss_t)(asm_rv32_t *state, mp_uint_t r1, mp_uint_t r2);
+
+static bool handle_zcmp_opcode(emit_inline_asm_t *emit, qstr opcode, mp_parse_node_t *argument_nodes) {
+    mp_uint_t argument_index = 0;
+
+    for (size_t index = 0; index < MP_ARRAY_SIZE(ZCMP_OPCODE_NAMES); index++) {
+        if (ZCMP_OPCODE_NAMES[index] != opcode) {
+            continue;
+        }
+        const void *handler = ZCMP_OPCODE_HANDLERS[index];
+        if (opcode == MP_QSTR_cm_mva01s || opcode == MP_QSTR_cm_mvsa01) {
+            mp_uint_t register_lhs = 0;
+            mp_uint_t register_rhs = 0;
+
+            if (!parse_register_node(argument_nodes[0], &register_lhs, false) ||
+                ((1U << register_lhs) & 0x00FC0300) == 0) {
+                goto invalid_s_register;
+            }
+
+            if (!parse_register_node(argument_nodes[1], &register_rhs, false) ||
+                ((1U << register_rhs) & 0x00FC0300) == 0) {
+                argument_index = 1;
+                goto invalid_s_register;
+            }
+
+            if (register_lhs == register_rhs) {
+                emit_inline_rv32_error_exc(emit,
+                    mp_obj_new_exception_msg_varg(&mp_type_SyntaxError,
+                        MP_ERROR_TEXT("opcode '%q': registers must be different"),
+                        opcode));
+                return false;
+            }
+
+            ((call_ss_t)handler)(&emit->as, register_lhs, register_rhs);
+            return true;
+        }
+
+        mp_uint_t register_list;
+        if (!extract_register_list(emit, opcode, argument_nodes[0], &register_list)) {
+            emit_inline_rv32_error_exc(emit,
+                mp_obj_new_exception_msg_varg(&mp_type_SyntaxError,
+                    MP_ERROR_TEXT("opcode '%q': malformed register list"),
+                    opcode));
+            return false;
+        }
+
+        mp_obj_t stack_adjustment_object;
+        if (!mp_parse_node_get_int_maybe(argument_nodes[1], &stack_adjustment_object)) {
+            emit_inline_rv32_error_exc(emit,
+                mp_obj_new_exception_msg_varg(&mp_type_SyntaxError,
+                    ET_WRONG_ARGUMENT_KIND, opcode, 2, MP_QSTR_integer));
+            return false;
+        }
+        mp_int_t stack_adjustment = mp_obj_get_int(stack_adjustment_object);
+        // Either 0, 16, 32, or 48.
+        if ((abs((int32_t)stack_adjustment) & ~0x30U) != 0 ||
+            ((opcode == MP_QSTR_cm_push) && stack_adjustment > 0) ||
+            ((opcode != MP_QSTR_cm_push) && stack_adjustment < 0)) {
+            emit_inline_rv32_error_exc(emit,
+                mp_obj_new_exception_msg_varg(&mp_type_SyntaxError,
+                    MP_ERROR_TEXT("opcode '%q': invalid stack adjustment"),
+                    opcode));
+            return false;
+        }
+        ((call_xi_t)handler)(&emit->as, register_list, abs((int32_t)stack_adjustment));
+        return true;
+    }
+
+    return false;
+
+invalid_s_register:
+    emit_inline_rv32_error_exc(emit,
+        mp_obj_new_exception_msg_varg(&mp_type_SyntaxError,
+            MP_ERROR_TEXT("opcode '%q' argument %d: wrong register(s)"),
+            opcode, argument_index + 1));
+    return false;
 }
 
 static void emit_inline_rv32_opcode(emit_inline_asm_t *emit, qstr opcode, mp_uint_t arguments_count, mp_parse_node_t *argument_nodes) {
@@ -785,10 +889,13 @@ static void emit_inline_rv32_opcode(emit_inline_asm_t *emit, qstr opcode, mp_uin
         }
     }
 
-    if (!opcode_data) {
-        emit_inline_rv32_error_exc(emit,
-            mp_obj_new_exception_msg_varg(&mp_type_SyntaxError,
-                MP_ERROR_TEXT("unknown RV32 instruction '%q'"), opcode));
+    if ((asm_rv32_allowed_extensions() & RV32_EXT_ZCMP) && !opcode_data && (arguments_count == 2) && handle_zcmp_opcode(emit, opcode, argument_nodes)) {
+        return;
+    }
+
+    if (!opcode_data || (asm_rv32_allowed_extensions() & opcode_data->required_extensions) != opcode_data->required_extensions) {
+        emit_inline_rv32_error_exc(emit, mp_obj_new_exception_msg_varg(&mp_type_SyntaxError,
+            MP_ERROR_TEXT("invalid RV32 instruction '%q'"), opcode));
         return;
     }
 
@@ -796,36 +903,36 @@ static void emit_inline_rv32_opcode(emit_inline_asm_t *emit, qstr opcode, mp_uin
     assert((opcode_data->argument2_mask < MP_ARRAY_SIZE(OPCODE_MASKS)) && "Argument #2 opcode mask index out of bounds.");
     assert((opcode_data->argument3_mask < MP_ARRAY_SIZE(OPCODE_MASKS)) && "Argument #3 opcode mask index out of bounds.");
     assert((opcode_data->calling_convention < CALL_COUNT) && "Calling convention index out of bounds.");
-    if (opcode_data->calling_convention != CALL_RIR) {
-        if (opcode_data->arguments_count != arguments_count) {
-            emit_inline_rv32_error_exc(emit,
-                mp_obj_new_exception_msg_varg(&mp_type_SyntaxError,
-                    ET_WRONG_ARGUMENTS_COUNT, opcode, opcode_data->arguments_count));
-            return;
-        }
-        if (opcode_data->arguments_count >= 1 && !validate_argument(emit, opcode, opcode_data, argument_nodes[0], 0)) {
-            return;
-        }
-        if (opcode_data->arguments_count >= 2 && !validate_argument(emit, opcode, opcode_data, argument_nodes[1], 1)) {
-            return;
-        }
-        if (opcode_data->arguments_count >= 3 && !validate_argument(emit, opcode, opcode_data, argument_nodes[2], 2)) {
-            return;
-        }
-        handle_opcode(emit, opcode, opcode_data, argument_nodes);
-        return;
-    }
-
-    assert((opcode_data->argument2_kind & U) == 0 && "Offset must not be unsigned.");
-    assert((opcode_data->argument2_kind & Z) == 0 && "Offset can be zero.");
-
-    if (arguments_count != 2) {
+    mp_uint_t serialised_arguments[3] = { 0 };
+    if (arguments_count != opcode_data->parse_nodes) {
         emit_inline_rv32_error_exc(emit,
-            mp_obj_new_exception_msg_varg(&mp_type_SyntaxError, ET_WRONG_ARGUMENTS_COUNT, opcode, 2));
+            mp_obj_new_exception_msg_varg(&mp_type_SyntaxError,
+                ET_WRONG_ARGUMENTS_COUNT, opcode, opcode_data->parse_nodes));
         return;
     }
 
-    handle_load_store_opcode_with_offset(emit, opcode, opcode_data, argument_nodes);
+    if (opcode_data->parse_nodes >= 1 && !serialise_argument(emit, opcode_data, argument_nodes[0], 0, &serialised_arguments[0])) {
+        return;
+    }
+    if (opcode_data->calling_convention == CALL_RIR) {
+        // "register, offset(base)" calls require some preprocessing to
+        // split the offset and base nodes - not to mention that if the offset
+        // is negative, the parser won't see the offset as a single node but as
+        // a sequence of the minus sign token followed by the number itself.
+
+        if (!serialise_register_offset_node(emit, opcode_data, argument_nodes[1], 1, &serialised_arguments[1], &serialised_arguments[2])) {
+            return;
+        }
+    } else {
+        if (opcode_data->parse_nodes >= 2 && !serialise_argument(emit, opcode_data, argument_nodes[1], 1, &serialised_arguments[1])) {
+            return;
+        }
+        if (opcode_data->parse_nodes >= 3 && !serialise_argument(emit, opcode_data, argument_nodes[2], 2, &serialised_arguments[2])) {
+            return;
+        }
+    }
+
+    handle_opcode(emit, opcode_data, serialised_arguments);
 }
 
 #undef N

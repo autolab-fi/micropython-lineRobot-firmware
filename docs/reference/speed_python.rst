@@ -182,9 +182,13 @@ The const() declaration
 
 MicroPython provides a ``const()`` declaration. This works in a similar way
 to ``#define`` in C in that when the code is compiled to bytecode the compiler
-substitutes the numeric value for the identifier. This avoids a dictionary
+substitutes the constant value for the identifier. This avoids a dictionary
 lookup at runtime. The argument to ``const()`` may be anything which, at
-compile time, evaluates to an integer e.g. ``0x100`` or ``1 << 8``.
+compile time, evaluates to a constant e.g. ``0x100``, ``1 << 8``,
+``"string"``, ``0.001``, ``b"\x00\xff"`` or ``("read", "write")``.
+
+See :func:`micropython.const` for complete documentation including usage
+requirements, limitations, and examples.
 
 .. _Caching:
 
@@ -243,9 +247,14 @@ no adaptation (but see below). It is invoked by means of a function decorator:
 
 There are certain limitations in the current implementation of the native code emitter.
 
-* Context managers are not supported (the ``with`` statement).
-* Generators are not supported.
 * If ``raise`` is used an argument must be supplied.
+* The background scheduler (see `micropython.schedule`) is not run during
+  execution of native code.
+* On targets with threading and the GIL, the GIL is not released during
+  execution of native code.
+
+To mitigate the last two points, long running native functions should call
+``time.sleep(0)`` periodically, which will run the scheduler and bounce the GIL.
 
 The trade-off for the improved performance (roughly twice as fast as bytecode) is an
 increase in compiled code size.

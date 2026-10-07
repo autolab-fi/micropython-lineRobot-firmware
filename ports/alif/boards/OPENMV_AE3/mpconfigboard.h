@@ -2,9 +2,6 @@
 #define MICROPY_HW_MCU_NAME         "AE302F80F55D5AE"
 
 #define MICROPY_OBJ_REPR            (MICROPY_OBJ_REPR_C)
-typedef intptr_t mp_int_t; // must be pointer size
-typedef uintptr_t mp_uint_t; // must be pointer size
-typedef intptr_t mp_off_t;
 
 #define MICROPY_HW_USB_MSC          (CORE_M55_HP)
 #define MICROPY_HW_ENABLE_HW_I2C    (1)
@@ -13,6 +10,11 @@ typedef intptr_t mp_off_t;
 // ROMFS partitions
 #define MICROPY_HW_ROMFS_ENABLE_PART0 (1)
 #define MICROPY_HW_ROMFS_ENABLE_PART1 (CORE_M55_HP)
+
+// CAN bus
+#define MICROPY_PY_MACHINE_CAN      (1)
+#define MICROPY_HW_CAN1_NAME        "CAN1"
+#define MICROPY_HW_NUM_CAN          (1)
 
 // I2C buses
 #define MICROPY_HW_I2C1_SCL         (pin_P0_5)
@@ -70,8 +72,8 @@ extern void board_exit_standby(void);
 // This is used for alif.Flash() and USB MSC.
 #define MICROPY_HW_FLASH_STORAGE_BASE_ADDR      (0)
 #define MICROPY_HW_FLASH_STORAGE_BYTES          (32 * 1024 * 1024)
-#define MICROPY_HW_FLASH_STORAGE_FS_BYTES       (16 * 1024 * 1024)
-#define MICROPY_HW_FLASH_STORAGE_ROMFS_BYTES    (16 * 1024 * 1024)
+#define MICROPY_HW_FLASH_STORAGE_FS_BYTES       (8 * 1024 * 1024)
+#define MICROPY_HW_FLASH_STORAGE_ROMFS_BYTES    (24 * 1024 * 1024)
 
 // Murata 1YN configuration
 #define CYW43_CHIPSET_FIRMWARE_INCLUDE_FILE     "lib/cyw43-driver/firmware/w43439_sdio_1yn_7_95_59_combined.h"

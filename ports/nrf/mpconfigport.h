@@ -69,6 +69,11 @@
 #define MICROPY_VFS                        (CORE_FEAT)
 #endif
 
+// VfsROM filesystem
+#ifndef MICROPY_VFS_ROM
+#define MICROPY_VFS_ROM                    (CORE_FEAT)
+#endif
+
 // micro:bit filesystem
 #ifndef MICROPY_MBFS
 #define MICROPY_MBFS                       (!MICROPY_VFS)
@@ -82,9 +87,7 @@
 #define MICROPY_PY_ARRAY_SLICE_ASSIGN      (CORE_FEAT)
 #endif
 
-#ifndef MICROPY_PY_SYS_PLATFORM
 #define MICROPY_PY_SYS_PLATFORM            "nrf"
-#endif
 
 #ifndef MICROPY_PY_SYS_STDFILES
 #define MICROPY_PY_SYS_STDFILES            (CORE_FEAT)
@@ -92,6 +95,10 @@
 
 #ifndef MICROPY_PY_BINASCII
 #define MICROPY_PY_BINASCII                (CORE_FEAT)
+#endif
+
+#ifndef MICROPY_PY_SELECT
+#define MICROPY_PY_SELECT                  (MICROPY_PY_ASYNCIO)
 #endif
 
 #ifndef MICROPY_PY_NRF
@@ -120,6 +127,7 @@
 #define MICROPY_ENABLE_GC           (1)
 #define MICROPY_ENABLE_FINALISER    (1)
 #define MICROPY_STACK_CHECK         (1)
+#define MICROPY_STACK_CHECK_MARGIN  (400)
 #define MICROPY_HELPER_REPL         (1)
 #define MICROPY_REPL_INFO           (1)
 #define MICROPY_REPL_AUTO_INDENT    (1)
@@ -220,6 +228,16 @@
 #endif
 
 #define MICROPY_PY_MACHINE_PWM      (MICROPY_PY_MACHINE_HW_PWM || MICROPY_PY_MACHINE_SOFT_PWM)
+
+// nrf91 (Cortex-M33 with TrustZone) has POWER->GPREGRET as a 2-element array
+// rather than separate GPREGRET/GPREGRET2 fields, and access requires the
+// secure/non-secure peripheral split. Not supported here.
+#if !defined(NRF91)
+#ifndef MICROPY_PY_MACHINE_MEM_BACKUP
+#define MICROPY_PY_MACHINE_MEM_BACKUP (1)
+#endif
+#define MICROPY_PY_MACHINE_MEM_BACKUP_INCLUDEFILE "ports/nrf/machine_mem_backup.c"
+#endif
 #define MICROPY_PY_MACHINE_PWM_DUTY (1)
 
 #if MICROPY_PY_MACHINE_HW_PWM
@@ -264,6 +282,7 @@
 #define MICROPY_ERROR_REPORTING               (2)
 #define MICROPY_FULL_CHECKS                   (1)
 #define MICROPY_GC_ALLOC_THRESHOLD            (1)
+#define MICROPY_MODULE___FILE__               (1)
 #define MICROPY_MODULE_GETATTR                (1)
 #define MICROPY_MULTIPLE_INHERITANCE          (1)
 #define MICROPY_PY_ARRAY                      (1)
@@ -272,6 +291,7 @@
 #define MICROPY_PY_ATTRTUPLE                  (1)
 #define MICROPY_PY_BUILTINS_BYTEARRAY         (1)
 #define MICROPY_PY_BUILTINS_DICT_FROMKEYS     (1)
+#define MICROPY_PY_BUILTINS_DIR               (1)
 #define MICROPY_PY_BUILTINS_ENUMERATE         (1)
 #define MICROPY_PY_BUILTINS_EVAL_EXEC         (1)
 #define MICROPY_PY_BUILTINS_FILTER            (1)
@@ -288,9 +308,7 @@
 #define MICROPY_PY_GENERATOR_PEND_THROW       (1)
 #define MICROPY_PY_MATH                       (1)
 #define MICROPY_PY_STRUCT                     (1)
-#define MICROPY_PY_SYS                        (1)
 #define MICROPY_PY_SYS_PATH_ARGV_DEFAULTS     (1)
-#define MICROPY_PY___FILE__                   (1)
 #endif
 
 #ifndef MICROPY_PY_UBLUEPY
@@ -335,12 +353,8 @@ void *nrf_native_code_commit(void *, unsigned int, void *);
 
 #define MP_SSIZE_MAX (0x7fffffff)
 
-#define UINT_FMT "%u"
-#define INT_FMT "%d"
 #define HEX2_FMT "%02x"
 
-typedef int mp_int_t; // must be pointer size
-typedef unsigned int mp_uint_t; // must be pointer size
 typedef long mp_off_t;
 
 #if MICROPY_HW_ENABLE_RNG
@@ -352,10 +366,11 @@ long unsigned int rng_generate_random_word(void);
 #include "boardmodules.h"
 #endif // BOARD_SPECIFIC_MODULES
 
-// extra built in names to add to the global namespace
+#if MICROPY_MBFS
+// The builtins.open function must be explicitly added when using the micro:bit filesystem.
 #define MICROPY_PORT_BUILTINS \
-    { MP_ROM_QSTR(MP_QSTR_help), MP_ROM_PTR(&mp_builtin_help_obj) }, \
-    { MP_ROM_QSTR(MP_QSTR_open), MP_ROM_PTR(&mp_builtin_open_obj) }, \
+    { MP_ROM_QSTR(MP_QSTR_open), MP_ROM_PTR(&mp_builtin_open_obj) },
+#endif
 
 // extra constants
 #define MICROPY_PORT_CONSTANTS \
@@ -378,8 +393,7 @@ long unsigned int rng_generate_random_word(void);
 
 #define MICROPY_EVENT_POLL_HOOK \
     do { \
-        extern void mp_handle_pending(bool); \
-        mp_handle_pending(true); \
+        mp_handle_pending(MP_HANDLE_PENDING_CALLBACKS_AND_EXCEPTIONS); \
         __WFI(); \
     } while (0);
 

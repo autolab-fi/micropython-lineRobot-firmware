@@ -2,10 +2,10 @@ BOARD ?= ALIF_ENSEMBLE
 BOARD_DIR ?= boards/$(BOARD)
 BUILD ?= build-$(BOARD)
 MCU_CORE ?= M55_HP
-GIT_SUBMODULES += lib/tinyusb lib/alif_ensemble-cmsis-dfp lib/alif-security-toolkit
+GIT_SUBMODULES += lib/CMSIS_5 lib/tinyusb lib/alif_ensemble-cmsis-dfp lib/alif-security-toolkit
 PORT ?= /dev/ttyACM0
 
-ALIF_TOOLS ?= ../../lib/alif-security-toolkit/toolkit
+ALIF_TOOLS ?= $(TOP)/lib/alif-security-toolkit/toolkit
 
 JLINK_CMD_PREFIX = \
 ExitOnError 1\n\
@@ -21,6 +21,7 @@ Reset\n\
 Exit
 
 ALIF_TOC_CONFIG = alif_cfg.json
+ALIF_TOC_BIN = $(BUILD)/firmware.toc.bin
 ALIF_TOC_APPS = $(BUILD)/$(ALIF_TOC_CONFIG)
 ALIF_TOC_CFLAGS += -DTOC_CFG_FILE=$(ALIF_TOOLKIT_CFG_FILE)
 
@@ -69,7 +70,7 @@ include $(TOP)/extmod/extmod.mk
 # Main targets
 
 .PHONY: all
-all: $(BUILD)/firmware.toc.bin
+all: $(BUILD)/firmware.zip
 
 # Force make commands to run the targets every time
 # regardless of whether firmware.toc.bin already exists
@@ -81,26 +82,30 @@ $(BUILD):
 	$(MKDIR) -p $@
 
 $(BUILD)/M55_HP/firmware.bin:
-	make -f alif.mk MCU_CORE=M55_HP MICROPY_PY_OPENAMP_MODE=0
+	$(MAKE) -f alif.mk BUILD=$(BUILD)/M55_HP MCU_CORE=M55_HP MICROPY_PY_OPENAMP_MODE=0 BOARD=$(BOARD)
 
 $(BUILD)/M55_HE/firmware.bin:
-	make -f alif.mk MCU_CORE=M55_HE MICROPY_PY_OPENAMP_MODE=1
+	$(MAKE) -f alif.mk BUILD=$(BUILD)/M55_HE MCU_CORE=M55_HE MICROPY_PY_OPENAMP_MODE=1 BOARD=$(BOARD)
 
 $(BUILD)/$(ALIF_TOC_CONFIG): mcu/$(ALIF_TOC_CONFIG).in | $(BUILD)
 	$(ECHO) "Preprocess toc config $@"
 	$(Q)$(CPP) -P -E $(ALIF_TOC_CFLAGS) - < mcu/$(ALIF_TOC_CONFIG).in > $@
 
-$(BUILD)/firmware.toc.bin: $(ALIF_TOC_APPS)
-	$(Q)python $(ALIF_TOOLS)/app-gen-toc.py \
+$(ALIF_TOC_BIN): $(ALIF_TOC_APPS)
+	$(Q)$(PYTHON) $(ALIF_TOOLS)/app-gen-toc.py \
 		--filename $(abspath $(BUILD)/$(ALIF_TOC_CONFIG)) \
 		--output-dir $(BUILD) \
 		--firmware-dir $(BUILD) \
 		--output $@
 
+$(BUILD)/firmware.zip: $(ALIF_TOC_BIN) $(ALIF_TOC_APPS)
+	$(ECHO) "Create $@"
+	$(Q)$(ZIP) -q - $(BUILD)/application_package.ds $^ > $@
+
 .PHONY: deploy
-deploy: $(BUILD)/firmware.toc.bin
+deploy: $(ALIF_TOC_BIN)
 	$(ECHO) "Writing $< to the board"
-	$(Q)python $(ALIF_TOOLS)/app-write-mram.py \
+	$(Q)$(PYTHON) $(ALIF_TOOLS)/app-write-mram.py \
 		--cfg-part $(ALIF_TOOLKIT_CFG_PART) \
 		--port $(PORT) \
 		--pad \
@@ -112,13 +117,13 @@ deploy-jlink: $(ALIF_TOC_APPS)
 
 .PHONY: maintenance
 maintenance:
-	$(Q)python $(ALIF_TOOLS)/maintenance.py \
+	$(Q)$(PYTHON) $(ALIF_TOOLS)/maintenance.py \
 		--cfg-part $(ALIF_TOOLKIT_CFG_PART) \
 		--port $(PORT)
 
 .PHONY: update-system-package
 update-system-package:
-	$(Q)python $(ALIF_TOOLS)/updateSystemPackage.py \
+	$(Q)$(PYTHON) $(ALIF_TOOLS)/updateSystemPackage.py \
 		--cfg-part $(ALIF_TOOLKIT_CFG_PART) \
 		--port $(PORT)
 

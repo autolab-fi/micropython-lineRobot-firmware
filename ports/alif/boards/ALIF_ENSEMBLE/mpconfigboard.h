@@ -10,6 +10,11 @@
 #define MICROPY_HW_ROMFS_ENABLE_PART0           (1)
 #define MICROPY_HW_ROMFS_ENABLE_PART1           (CORE_M55_HP)
 
+// CAN bus
+#define MICROPY_PY_MACHINE_CAN                  (1)
+#define MICROPY_HW_CAN1_NAME                    "CAN1"
+#define MICROPY_HW_NUM_CAN                      (1)
+
 // I2C buses
 #define MICROPY_HW_I2C0_SCL                     (pin_P0_3)
 #define MICROPY_HW_I2C0_SDA                     (pin_P0_2)
@@ -54,3 +59,7 @@
 #define MICROPY_HW_FLASH_STORAGE_BYTES          (32 * 1024 * 1024)
 #define MICROPY_HW_FLASH_STORAGE_FS_BYTES       (16 * 1024 * 1024)
 #define MICROPY_HW_FLASH_STORAGE_ROMFS_BYTES    (16 * 1024 * 1024)
+
+#define MICROPY_BOARD_EARLY_INIT                board_early_init
+
+void board_early_init(void);

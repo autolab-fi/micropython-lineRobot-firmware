@@ -60,9 +60,18 @@ enum {
 // This structure contains dynamic configuration for the compiler.
 #if MICROPY_DYNAMIC_COMPILER
 typedef struct mp_dynamic_compiler_t {
+    // This is used to let mpy-cross pass options to the emitter chosen with
+    // `native_arch`.  The main use case for the time being is to give the
+    // RV32 emitter extended information about which extensions can be
+    // optionally used, in order to generate code that's better suited for the
+    // hardware platform the code will run on.
+    void *backend_options;
     uint8_t small_int_bits; // must be <= host small_int_bits
     uint8_t native_arch;
     uint8_t nlr_buf_num_regs;
+    #if MICROPY_ENABLE_SOURCE_LINE
+    bool include_source_lines;
+    #endif
 } mp_dynamic_compiler_t;
 extern mp_dynamic_compiler_t mp_dynamic_compiler;
 #endif
@@ -101,6 +110,9 @@ typedef struct _mp_state_mem_area_t {
     #if MICROPY_ENABLE_FINALISER
     byte *gc_finaliser_table_start;
     #endif
+    #if MICROPY_PY_WEAKREF
+    byte *gc_weakref_table_start;
+    #endif
     byte *gc_pool_start;
     byte *gc_pool_end;
 
@@ -117,6 +129,10 @@ typedef struct _mp_state_mem_t {
     #endif
 
     mp_state_mem_area_t area;
+    #if MICROPY_GC_SPLIT_HEAP
+    byte *area_pool_min;  // Min of all gc_pool_start values across all areas
+    byte *area_pool_max;  // Max of all gc_pool_end values across all areas
+    #endif
 
     int gc_stack_overflow;
     MICROPY_GC_STACK_ENTRY_TYPE gc_block_stack[MICROPY_ALLOC_GC_STACK_SIZE];
@@ -221,6 +237,9 @@ typedef struct _mp_state_vm_t {
     mp_uint_t mp_optimise_value;
     #if MICROPY_EMIT_NATIVE
     uint8_t default_emit_opt; // one of MP_EMIT_OPT_xxx
+    #endif
+    #if MICROPY_DEBUG_PRINTERS
+    mp_uint_t mp_verbose_flag;
     #endif
     #endif
 

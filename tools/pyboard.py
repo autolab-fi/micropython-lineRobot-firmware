@@ -70,6 +70,7 @@ Or:
 import ast
 import errno
 import os
+import stat
 import struct
 import sys
 import time
@@ -282,7 +283,7 @@ class Pyboard:
         if device.startswith("exec:"):
             self.serial = ProcessToSerial(device[len("exec:") :])
         elif device.startswith("execpty:"):
-            self.serial = ProcessPtyToTerminal(device[len("qemupty:") :])
+            self.serial = ProcessPtyToTerminal(device[len("execpty:") :])
         elif device and device[0].isdigit() and device[-1].isdigit() and device.count(".") == 3:
             # device looks like an IP address
             self.serial = TelnetToSerial(device, user, password, read_timeout=10)
@@ -333,6 +334,23 @@ class Pyboard:
             if delayed:
                 print("")
 
+        if device.startswith("execpty:"):
+            self.is_pty = True
+        else:
+            self.is_pty = self._is_pty_device(device)
+
+    @staticmethod
+    def _is_pty_device(device):
+        """Detect if device is a PTY (pseudo-terminal), e.g. used by QEMU."""
+        if device.startswith("/dev/pts/"):
+            try:
+                st = os.stat(device)
+                if stat.S_ISCHR(st.st_mode) and os.major(st.st_rdev) == 136:
+                    return True
+            except (OSError, AttributeError):
+                pass
+        return False
+
     def close(self):
         self.serial.close()
 
@@ -358,8 +376,10 @@ class Pyboard:
         while True:
             if data.endswith(ending):
                 break
-            elif self.serial.inWaiting() > 0:
+            new_data = None
+            if self.is_pty or self.serial.inWaiting() > 0:
                 new_data = self.serial.read(1)
+            if new_data:
                 if data_consumer:
                     data_consumer(new_data)
                     data = new_data
@@ -530,8 +550,8 @@ class Pyboard:
             return ret
 
     # In Python3, call as pyboard.exec(), see the setattr call below.
-    def exec_(self, command, data_consumer=None):
-        ret, ret_err = self.exec_raw(command, data_consumer=data_consumer)
+    def exec_(self, command, timeout=10, data_consumer=None):
+        ret, ret_err = self.exec_raw(command, timeout, data_consumer)
         if ret_err:
             raise PyboardError("exception", ret, ret_err)
         return ret

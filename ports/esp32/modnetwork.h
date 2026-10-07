@@ -26,17 +26,18 @@
 #ifndef MICROPY_INCLUDED_ESP32_MODNETWORK_H
 #define MICROPY_INCLUDED_ESP32_MODNETWORK_H
 
+#include "esp_wifi_types.h"
 #include "esp_netif.h"
 
-// lan867x component requires newer IDF version
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0) && CONFIG_IDF_TARGET_ESP32
+// lan867x component requires Original ESP32
+#if CONFIG_IDF_TARGET_ESP32
 #define PHY_LAN867X_ENABLED (1)
 #else
 #define PHY_LAN867X_ENABLED (0)
 #endif
 
 // PHY_GENERIC support requires newer IDF version
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0) && CONFIG_IDF_TARGET_ESP32
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
 #define PHY_GENERIC_ENABLED (1)
 #else
 #define PHY_GENERIC_ENABLED (0)
@@ -51,6 +52,7 @@ enum {
     #if PHY_GENERIC_ENABLED
     PHY_GENERIC,
     #endif
+    PHY_OPENETH,
     // PHYs which are actually SPI Ethernet MAC+PHY chips:
     PHY_KSZ8851SNL = 100, PHY_DM9051, PHY_W5500
 };

@@ -80,7 +80,7 @@ static void frame_print(const mp_print_t *print, mp_obj_t o_in, mp_print_kind_t 
         "<frame at 0x%p, file '%q', line %d, code %q>",
         frame,
         MP_CODE_QSTR_MAP(code->context, 0),
-        frame->lineno,
+        (int)frame->lineno,
         MP_CODE_QSTR_MAP(code->context, prelude->qstr_block_name_idx)
         );
 }
@@ -173,7 +173,7 @@ static mp_obj_t mp_prof_callback_invoke(mp_obj_t callback, prof_callback_args_t 
     mp_prof_is_executing = false;
 
     if (MP_STATE_THREAD(mp_pending_exception) != MP_OBJ_NULL) {
-        mp_handle_pending(true);
+        mp_handle_pending(MP_HANDLE_PENDING_CALLBACKS_AND_EXCEPTIONS);
     }
     return top;
 }

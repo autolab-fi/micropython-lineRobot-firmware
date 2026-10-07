@@ -12,10 +12,6 @@
 #define MICROPY_PY_NETWORK_HOSTNAME_DEFAULT "mpy-nicla-vision"
 
 #define MICROPY_OBJ_REPR            (MICROPY_OBJ_REPR_C)
-#define UINT_FMT                    "%u"
-#define INT_FMT                     "%d"
-typedef int mp_int_t;               // must be pointer size
-typedef unsigned int mp_uint_t;     // must be pointer size
 
 #define MICROPY_FATFS_EXFAT         (1)
 #define MICROPY_HW_ENABLE_RTC       (1)
@@ -231,7 +227,9 @@ extern struct _spi_bdev_t spi_bdev;
 #define MICROPY_HW_BLE_UART_BAUDRATE_DOWNLOAD_FIRMWARE (3000000)
 
 #define MICROPY_HW_USB_VID                      0x2341
+#ifndef MICROPY_HW_USB_PID
 #define MICROPY_HW_USB_PID                      0x055F
+#endif
 #define MICROPY_HW_USB_PID_CDC_MSC              (MICROPY_HW_USB_PID)
 #define MICROPY_HW_USB_PID_CDC_HID              (MICROPY_HW_USB_PID)
 #define MICROPY_HW_USB_PID_CDC                  (MICROPY_HW_USB_PID)

@@ -29,7 +29,6 @@
 #include "py/runtime.h"
 #include "py/gc.h"
 #include "py/mperrno.h"
-#include "py/stackctrl.h"
 #include "shared/readline/readline.h"
 #include "shared/runtime/gchelper.h"
 #include "shared/runtime/pyexec.h"
@@ -38,6 +37,7 @@
 #include "ticks.h"
 #include "led.h"
 #include "pendsv.h"
+#include "psram.h"
 #include "modmachine.h"
 #include "modmimxrt.h"
 
@@ -55,10 +55,16 @@
 #endif
 
 #include "systick.h"
+#include "extmod/modmachine.h"
 #include "extmod/modnetwork.h"
 #include "extmod/vfs.h"
 
 extern uint8_t _sstack, _estack, _gc_heap_start, _gc_heap_end;
+extern void machine_encoder_deinit_all(void);
+#if MICROPY_PY_MACHINE_CAN
+void machine_can_deinit_all(void);
+#endif
+
 
 void board_init(void);
 
@@ -66,6 +72,10 @@ int main(void) {
     board_init();
     ticks_init();
     pendsv_init();
+
+    #if MICROPY_HW_ENABLE_PSRAM
+    size_t psram_size = configure_external_ram();
+    #endif
 
     #if MICROPY_PY_LWIP
     // lwIP doesn't allow to reinitialise itself by subsequent calls to this function
@@ -99,10 +109,22 @@ int main(void) {
         led_init();
         #endif
 
-        mp_stack_set_top(&_estack);
-        mp_stack_set_limit(&_estack - &_sstack - 1024);
+        mp_cstack_init_with_top(&_estack, &_estack - &_sstack);
 
+        #if MICROPY_HW_ENABLE_PSRAM
+        if (psram_size) {
+            #if MICROPY_GC_SPLIT_HEAP
+            gc_init(&_gc_heap_start, &_gc_heap_end);
+            gc_add((void *)PSRAM_BASE, (void *)(PSRAM_BASE + psram_size));
+            #else
+            gc_init((void *)PSRAM_BASE, (void *)(PSRAM_BASE + psram_size));
+            #endif
+        } else {
+            gc_init(&_gc_heap_start, &_gc_heap_end);
+        }
+        #else
         gc_init(&_gc_heap_start, &_gc_heap_end);
+        #endif
         mp_init();
 
         #if MICROPY_PY_NETWORK
@@ -160,6 +182,9 @@ int main(void) {
 
     soft_reset_exit:
         mp_printf(MP_PYTHON_PRINTER, "MPY: soft reboot\n");
+        #if MICROPY_PY_MACHINE_CAN
+        machine_can_deinit_all();
+        #endif
         machine_pin_irq_deinit();
         machine_rtc_irq_deinit();
         #if MICROPY_PY_MACHINE_I2S
@@ -171,9 +196,16 @@ int main(void) {
         #if MICROPY_PY_NETWORK
         mod_network_deinit();
         #endif
+        #if MICROPY_PY_MACHINE_UART
         machine_uart_deinit_all();
+        #endif
+        #if MICROPY_PY_MACHINE_PWM
         machine_pwm_deinit_all();
+        #endif
         soft_timer_deinit();
+        #if MICROPY_PY_MACHINE_QECNT
+        machine_encoder_deinit_all();
+        #endif
         gc_sweep_all();
         mp_deinit();
     }
@@ -188,6 +220,11 @@ void gc_collect(void) {
 }
 
 void nlr_jump_fail(void *val) {
+    for (;;) {
+    }
+}
+
+void abort(void) {
     for (;;) {
     }
 }

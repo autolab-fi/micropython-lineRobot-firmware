@@ -149,6 +149,9 @@ static const mp_rom_map_elem_t machine_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_mem16), MP_ROM_PTR(&machine_mem16_obj) },
     { MP_ROM_QSTR(MP_QSTR_mem32), MP_ROM_PTR(&machine_mem32_obj) },
     #endif
+    #if MICROPY_PY_MACHINE_MEM_BACKUP
+    { MP_ROM_QSTR(MP_QSTR_mem_backup), MP_ROM_PTR(&machine_mem_backup_fun_obj) },
+    #endif
 
     // Miscellaneous functions.
     #if MICROPY_PY_MACHINE_BARE_METAL_FUNCS
@@ -213,17 +216,26 @@ static const mp_rom_map_elem_t machine_module_globals_table[] = {
     #if MICROPY_PY_MACHINE_ADC_BLOCK
     { MP_ROM_QSTR(MP_QSTR_ADCBlock), MP_ROM_PTR(&machine_adc_block_type) },
     #endif
+    #if MICROPY_PY_MACHINE_CAN
+    { MP_ROM_QSTR(MP_QSTR_CAN), MP_ROM_PTR(&machine_can_type) },
+    #endif
     #if MICROPY_PY_MACHINE_DAC
     { MP_ROM_QSTR(MP_QSTR_DAC), MP_ROM_PTR(&machine_dac_type) },
     #endif
     #if MICROPY_PY_MACHINE_I2C
     { MP_ROM_QSTR(MP_QSTR_I2C), MP_ROM_PTR(&machine_i2c_type) },
     #endif
+    #if MICROPY_PY_MACHINE_I2C_TARGET
+    { MP_ROM_QSTR(MP_QSTR_I2CTarget), MP_ROM_PTR(&machine_i2c_target_type) },
+    #endif
     #if MICROPY_PY_MACHINE_I2S
     { MP_ROM_QSTR(MP_QSTR_I2S), MP_ROM_PTR(&machine_i2s_type) },
     #endif
     #if MICROPY_PY_MACHINE_PWM
     { MP_ROM_QSTR(MP_QSTR_PWM), MP_ROM_PTR(&machine_pwm_type) },
+    #endif
+    #if MICROPY_PY_MACHINE_SDCARD
+    { MP_ROM_QSTR(MP_QSTR_SDCard), MP_ROM_PTR(&machine_sdcard_type) },
     #endif
     #if MICROPY_PY_MACHINE_SPI
     { MP_ROM_QSTR(MP_QSTR_SPI), MP_ROM_PTR(&machine_spi_type) },
